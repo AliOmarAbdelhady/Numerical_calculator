@@ -54,6 +54,8 @@ ALLOWED_NODES = (
 )
 
 PIVOT_TOLERANCE = 1e-12
+NEWTON_DERIVATIVE_TOLERANCE = 1e-15
+NEWTON_FORMULA = "x(i+1) = x(i) - f(x(i)) / f'(x(i))"
 
 
 def _ensure_number(value: Any, name: str) -> float:
@@ -394,22 +396,236 @@ def secant_method(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def simple_iteration_method(params: dict[str, Any]) -> dict[str, Any]:
-    g = compile_expression(params.get("gExpression", ""))
-    x_curr = _ensure_number(params.get("x0"), "x0")
-    tolerance = _ensure_positive_number(params.get("tolerance", 1e-6), "tolerance")
-    max_iterations = _ensure_iterations(params.get("maxIterations", 50))
+def _is_wrapped_expression(expression: str) -> bool:
+    if len(expression) < 2:
+        return False
 
-    steps: list[dict[str, float | int]] = []
+    pairs = {"(": ")", "[": "]"}
+    opening = expression[0]
+    if opening not in pairs or expression[-1] != pairs[opening]:
+        return False
+
+    stack: list[str] = []
+    for index, char in enumerate(expression):
+        if char in pairs:
+            stack.append(char)
+            continue
+        if char in pairs.values():
+            if not stack or pairs[stack[-1]] != char:
+                return False
+            stack.pop()
+            if not stack and index != len(expression) - 1:
+                return False
+
+    return not stack
+
+
+def _split_top_level_expressions(raw_expression: str) -> list[str]:
+    expression = raw_expression.strip()
+    while _is_wrapped_expression(expression):
+        expression = expression[1:-1].strip()
+
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    pairs = {"(": ")", "[": "]"}
+    closing = set(pairs.values())
+
+    for index, char in enumerate(expression):
+        if char in pairs:
+            depth += 1
+            continue
+        if char in closing:
+            depth -= 1
+            if depth < 0:
+                raise NumericalError("Expression syntax is invalid.")
+            continue
+        if depth == 0 and char in {",", ";", "\n"}:
+            part = expression[start:index].strip()
+            if part:
+                parts.append(part)
+            start = index + 1
+
+    if depth != 0:
+        raise NumericalError("Expression syntax is invalid.")
+
+    tail = expression[start:].strip()
+    if tail:
+        parts.append(tail)
+
+    return parts
+
+
+def _split_top_level_equation(expression: str) -> tuple[str, str] | None:
+    depth = 0
+    equals_index: int | None = None
+    pairs = {"(": ")", "[": "]"}
+    closing = set(pairs.values())
+
+    for index, char in enumerate(expression):
+        if char in pairs:
+            depth += 1
+            continue
+        if char in closing:
+            depth -= 1
+            if depth < 0:
+                raise NumericalError("Expression syntax is invalid.")
+            continue
+        if depth == 0 and char == "=":
+            if equals_index is not None:
+                raise NumericalError("Only one equals sign is allowed in an equation.")
+            equals_index = index
+
+    if depth != 0:
+        raise NumericalError("Expression syntax is invalid.")
+    if equals_index is None:
+        return None
+
+    left = expression[:equals_index].strip()
+    right = expression[equals_index + 1 :].strip()
+    if not left or not right:
+        raise NumericalError("Equation must have expressions on both sides of '='.")
+    return left, right
+
+
+def _parse_expression_tree(expression: str) -> ast.Expression:
+    normalized = expression.replace("^", "**")
+    try:
+        tree = ast.parse(normalized, mode="eval")
+    except SyntaxError as exc:
+        raise NumericalError("Expression syntax is invalid.") from exc
+
+    _ExpressionValidator("x").visit(tree)
+    return tree
+
+
+def _is_variable_node(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and node.id == "x"
+
+
+def _multiplication_factors(node: ast.AST) -> list[ast.AST]:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        return [*_multiplication_factors(node.left), *_multiplication_factors(node.right)]
+    return [node]
+
+
+def _multiply_factor_expressions(factors: list[ast.AST]) -> str:
+    if not factors:
+        return "1"
+    return " * ".join(f"({ast.unparse(factor)})" for factor in factors)
+
+
+def _expression_without_one_x_factor(node: ast.AST) -> str | None:
+    factors = _multiplication_factors(node)
+    for index, factor in enumerate(factors):
+        if _is_variable_node(factor):
+            return _multiply_factor_expressions([*factors[:index], *factors[index + 1 :]])
+    return None
+
+
+def _unique_expressions(expressions: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for expression in expressions:
+        key = "".join(expression.split())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(expression)
+    return unique
+
+
+def _fixed_point_expressions(expression: str) -> list[str]:
+    equation = _split_top_level_equation(expression)
+    if equation is None:
+        return [expression]
+
+    left, right = equation
+    left_tree = _parse_expression_tree(left)
+    right_tree = _parse_expression_tree(right)
+    candidates: list[str] = []
+
+    if _is_variable_node(left_tree.body):
+        candidates.append(right)
+    if _is_variable_node(right_tree.body):
+        candidates.append(left)
+
+    left_denominator = _expression_without_one_x_factor(left_tree.body)
+    if left_denominator is not None and not _is_variable_node(left_tree.body):
+        candidates.append(f"({right}) / ({left_denominator})")
+
+    right_denominator = _expression_without_one_x_factor(right_tree.body)
+    if right_denominator is not None and not _is_variable_node(right_tree.body):
+        candidates.append(f"({left}) / ({right_denominator})")
+
+    candidates = _unique_expressions(candidates)
+    if not candidates:
+        raise NumericalError("Equation could not be rearranged automatically. Enter one or more g(x) expressions instead.")
+    return candidates
+
+
+def _simple_iteration_expressions(params: dict[str, Any]) -> list[str]:
+    raw_expressions = params.get("gExpressions")
+    if raw_expressions is None:
+        raw_expression = params.get("gExpression", "")
+        if not isinstance(raw_expression, str):
+            raise NumericalError("gExpression must be an expression.")
+        raw_parts = _split_top_level_expressions(raw_expression)
+    else:
+        if not isinstance(raw_expressions, list):
+            raise NumericalError("gExpressions must be a list of expressions.")
+        raw_parts = []
+        for index, raw_expression in enumerate(raw_expressions):
+            if not isinstance(raw_expression, str):
+                raise NumericalError(f"gExpressions[{index + 1}] must be an expression.")
+            raw_parts.extend(_split_top_level_expressions(raw_expression))
+
+    expressions: list[str] = []
+    for raw_part in raw_parts:
+        expressions.extend(_fixed_point_expressions(raw_part))
+
+    if not expressions:
+        raise NumericalError("At least one g(x) expression is required.")
+    if len(expressions) > 12:
+        raise NumericalError("Simple iteration can try at most 12 g(x) expressions.")
+
+    return expressions
+
+
+def _run_simple_iteration_branch(
+    expression: str,
+    branch: int,
+    x0: float,
+    tolerance: float,
+    max_iterations: int,
+) -> dict[str, Any]:
+    g = compile_expression(expression)
+    x_curr = x0
+    steps: list[dict[str, float | int | str]] = []
     fixed_point = x_curr
     converged = False
+    error: float | None = None
 
     for iteration in range(1, max_iterations + 1):
-        x_next = g(x_curr)
+        try:
+            x_next = g(x_curr)
+        except NumericalError as exc:
+            return {
+                "branch": branch,
+                "gExpression": expression,
+                "fixedPoint": fixed_point,
+                "iterations": len(steps),
+                "converged": False,
+                "error": error,
+                "failure": str(exc),
+                "steps": steps,
+            }
+
         error = abs(x_next - x_curr)
         steps.append(
             {
                 "iteration": iteration,
+                "branch": branch,
                 "xCurrent": x_curr,
                 "xNext": x_next,
                 "gValue": x_next,
@@ -423,12 +639,70 @@ def simple_iteration_method(params: dict[str, Any]) -> dict[str, Any]:
         x_curr = x_next
 
     return {
-        "method": "Method of Simple Iteration",
+        "branch": branch,
+        "gExpression": expression,
         "fixedPoint": fixed_point,
         "iterations": len(steps),
         "converged": converged,
-        "tolerance": tolerance,
+        "error": error,
         "steps": steps,
+    }
+
+
+def _iteration_branch_rank(branch: dict[str, Any]) -> tuple[int, int, float, int, int]:
+    error = branch.get("error")
+    error_value = error if isinstance(error, (int, float)) and math.isfinite(error) else math.inf
+    return (
+        1 if branch.get("failure") else 0,
+        0 if branch.get("converged") else 1,
+        float(error_value),
+        int(branch.get("iterations", 0)),
+        int(branch.get("branch", 0)),
+    )
+
+
+def simple_iteration_method(params: dict[str, Any]) -> dict[str, Any]:
+    expressions = _simple_iteration_expressions(params)
+    x_curr = _ensure_number(params.get("x0"), "x0")
+    tolerance = _ensure_positive_number(params.get("tolerance", 1e-6), "tolerance")
+    max_iterations = _ensure_iterations(params.get("maxIterations", 50))
+
+    branches: list[dict[str, Any]] = []
+    for index, expression in enumerate(expressions, start=1):
+        try:
+            branch = _run_simple_iteration_branch(expression, index, x_curr, tolerance, max_iterations)
+        except NumericalError as exc:
+            branch = {
+                "branch": index,
+                "gExpression": expression,
+                "fixedPoint": x_curr,
+                "iterations": 0,
+                "converged": False,
+                "error": None,
+                "failure": str(exc),
+                "steps": [],
+            }
+        branches.append(branch)
+
+    selectable_branches = [branch for branch in branches if not branch.get("failure")]
+    if not selectable_branches:
+        failures = "; ".join(f"branch {branch['branch']}: {branch.get('failure', 'failed')}" for branch in branches)
+        raise NumericalError(f"All g(x) expressions failed: {failures}")
+
+    selected = min(selectable_branches, key=_iteration_branch_rank)
+    branch_summaries = [{key: value for key, value in branch.items() if key != "steps"} for branch in branches]
+
+    return {
+        "method": "Method of Simple Iteration",
+        "fixedPoint": selected["fixedPoint"],
+        "iterations": selected["iterations"],
+        "converged": selected["converged"],
+        "tolerance": tolerance,
+        "residual": selected["error"],
+        "selectedBranch": selected["branch"],
+        "selectedGExpression": selected["gExpression"],
+        "branches": branch_summaries,
+        "steps": selected["steps"],
     }
 
 
@@ -445,16 +719,24 @@ def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
     steps: list[dict[str, float | int]] = []
     root = x_curr
     value = f(x_curr)
+    residual = abs(value)
     converged = False
+    convergence_status = "max_iterations"
+    convergence_message = "Maximum iterations reached before |f(x)| was within tolerance."
+    warning: str | None = None
 
-    if abs(value) <= tolerance:
+    if residual <= tolerance:
         return {
             "method": "The Newton-Raphson Method",
             "root": root,
             "value": value,
+            "residual": residual,
             "iterations": 0,
             "converged": True,
             "tolerance": tolerance,
+            "formula": NEWTON_FORMULA,
+            "convergenceStatus": "converged",
+            "convergenceMessage": "Initial guess validates convergence because |f(x0)| is within tolerance.",
             "derivativeMode": "manual" if has_manual_derivative else "auto",
             "steps": steps,
         }
@@ -462,29 +744,40 @@ def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
     for iteration in range(max_iterations):
         fx = f(x_curr)
         dfx = derivative(x_curr)
-        if abs(dfx) < 1e-15:
+        if abs(dfx) < NEWTON_DERIVATIVE_TOLERANCE:
             raise NumericalError("Derivative is too close to zero.")
 
-        x_next = x_curr - fx / dfx
+        newton_ratio = fx / dfx
+        x_next = _finite_value(x_curr - newton_ratio, "Newton update")
         f_next = f(x_next)
         delta = x_next - x_curr
         error = abs(delta)
+        residual = abs(f_next)
         steps.append(
             {
                 "iteration": iteration,
                 "xCurrent": x_curr,
                 "fCurrent": fx,
                 "derivative": dfx,
+                "newtonRatio": newton_ratio,
                 "xNext": x_next,
                 "delta": delta,
                 "fNext": f_next,
                 "error": error,
+                "residual": residual,
             }
         )
         root = x_next
         value = f_next
-        if abs(f_next) <= tolerance or error <= tolerance:
+        if residual <= tolerance:
             converged = True
+            convergence_status = "converged"
+            convergence_message = "Validated convergence because |f(x(i+1))| is within tolerance."
+            break
+        if error <= tolerance:
+            convergence_status = "stalled"
+            convergence_message = "Newton step is within tolerance, but |f(x(i+1))| is still too large."
+            warning = "Convergence was not validated: the Newton step became tiny before the residual met tolerance."
             break
         x_curr = x_next
 
@@ -492,9 +785,14 @@ def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
         "method": "The Newton-Raphson Method",
         "root": root,
         "value": value,
+        "residual": residual,
         "iterations": len(steps),
         "converged": converged,
         "tolerance": tolerance,
+        "formula": NEWTON_FORMULA,
+        "convergenceStatus": convergence_status,
+        "convergenceMessage": convergence_message,
+        "warning": warning,
         "derivativeMode": "manual" if has_manual_derivative else "auto",
         "steps": steps,
     }

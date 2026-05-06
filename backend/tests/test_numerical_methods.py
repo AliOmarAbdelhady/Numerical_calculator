@@ -60,6 +60,34 @@ class NumericalMethodTests(unittest.TestCase):
         self.assertTrue(result["converged"])
         self.assertAlmostEqual(result["fixedPoint"], 0.7390851332, places=6)
 
+    def test_simple_iteration_method_tries_multiple_candidates(self):
+        result = simple_iteration_method(
+            {
+                "gExpression": "-sqrt(x - 2), sqrt(x + 2)",
+                "x0": 0,
+                "tolerance": 1e-8,
+                "maxIterations": 100,
+            }
+        )
+        self.assertTrue(result["converged"])
+        self.assertEqual(result["selectedBranch"], 2)
+        self.assertAlmostEqual(result["fixedPoint"], 2, places=6)
+        self.assertEqual(len(result["branches"]), 2)
+        self.assertIn("domain", result["branches"][0]["failure"])
+
+    def test_simple_iteration_method_rearranges_product_equation(self):
+        result = simple_iteration_method(
+            {
+                "gExpression": "3*x*e^(x) = 1",
+                "x0": 1,
+                "tolerance": 1e-8,
+                "maxIterations": 100,
+            }
+        )
+        self.assertTrue(result["converged"])
+        self.assertAlmostEqual(result["fixedPoint"], 0.2576276530, places=6)
+        self.assertIn("e ** x", result["selectedGExpression"])
+
     def test_newton_raphson_method(self):
         result = newton_raphson_method(
             {
@@ -71,11 +99,30 @@ class NumericalMethodTests(unittest.TestCase):
         )
         self.assertTrue(result["converged"])
         self.assertEqual(result["derivativeMode"], "auto")
+        self.assertEqual(result["formula"], "x(i+1) = x(i) - f(x(i)) / f'(x(i))")
+        self.assertEqual(result["convergenceStatus"], "converged")
         self.assertEqual(result["steps"][0]["iteration"], 0)
         self.assertAlmostEqual(result["steps"][0]["xCurrent"], 1)
         self.assertAlmostEqual(result["steps"][0]["derivative"], 2)
+        self.assertAlmostEqual(result["steps"][0]["newtonRatio"], -0.5)
+        self.assertAlmostEqual(result["steps"][0]["xNext"], 1.5)
         self.assertAlmostEqual(result["steps"][0]["delta"], 0.5)
+        self.assertLessEqual(result["residual"], result["tolerance"])
         self.assertAlmostEqual(result["root"], math.sqrt(2), places=8)
+
+    def test_newton_raphson_method_requires_residual_convergence(self):
+        result = newton_raphson_method(
+            {
+                "expression": "atan(1e12*x) + 2",
+                "x0": 0,
+                "tolerance": 1e-8,
+                "maxIterations": 100,
+            }
+        )
+        self.assertFalse(result["converged"])
+        self.assertEqual(result["convergenceStatus"], "stalled")
+        self.assertGreater(result["residual"], result["tolerance"])
+        self.assertLessEqual(result["steps"][0]["error"], result["tolerance"])
 
     def test_jacobi_method(self):
         result = jacobi_method(
