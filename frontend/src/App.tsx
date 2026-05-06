@@ -1312,16 +1312,11 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
 }
 
 function InterpolationVisuals({ result }: { result: ApiResult }) {
-  const termSteps = result.steps
-    .map((step, index) => ({ index, term: typeof step.term === "number" ? step.term : Number.NaN }))
-    .filter((step) => Number.isFinite(step.term));
   const hasDifferenceTable = Boolean((result.table?.length ?? 0) > 0 && result.tableKind !== "basis");
 
-  if (!hasDifferenceTable && termSteps.length === 0) {
+  if (!hasDifferenceTable) {
     return null;
   }
-
-  const maxTerm = Math.max(1e-12, ...termSteps.map((step) => Math.abs(step.term)));
 
   return (
     <div className="rounded-md border border-slate-200 bg-white shadow-panel dark:border-slate-700 dark:bg-slate-900">
@@ -1329,27 +1324,8 @@ function InterpolationVisuals({ result }: { result: ApiResult }) {
         <h2 className="text-lg font-semibold text-slate-950 dark:text-slate-50">Visuals</h2>
       </div>
 
-      <div className="space-y-5 p-4">
+      <div className="p-4">
         <DifferenceTableView rows={result.table ?? []} kind={result.tableKind} />
-        {termSteps.length > 0 && (
-          <div>
-            <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Term contribution</div>
-            <div className="space-y-2">
-              {termSteps.map((step) => (
-                <div key={step.index} className="grid grid-cols-[44px_minmax(0,1fr)_96px] items-center gap-3 text-xs">
-                  <span className="font-mono text-slate-500 dark:text-slate-300">k={step.index}</span>
-                  <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
-                    <div
-                      className={cn("h-full rounded-full", step.term >= 0 ? "bg-blue-600 dark:bg-sky-300" : "bg-rose-500")}
-                      style={{ width: `${Math.max(3, (Math.abs(step.term) / maxTerm) * 100)}%` }}
-                    />
-                  </div>
-                  <span className="overflow-hidden text-ellipsis whitespace-nowrap text-right font-mono text-slate-700 dark:text-slate-100">{formatNumber(step.term)}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
