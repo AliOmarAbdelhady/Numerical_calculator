@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import {
   AlertCircle,
@@ -31,7 +31,30 @@ import { Label } from "./components/ui/label";
 import { Textarea } from "./components/ui/textarea";
 import { cn } from "./lib/utils";
 
-type MethodKey = "bisection" | "secant" | "iteration" | "newton" | "jacobi" | "gauss_seidel" | "lagrange";
+type MethodKey =
+  | "bisection"
+  | "secant"
+  | "iteration"
+  | "newton"
+  | "jacobi"
+  | "gauss_seidel"
+  | "lagrange"
+  | "nfdf"
+  | "nbdf"
+  | "nfddf"
+  | "nbddf";
+
+type ResultPoint = {
+  x: number;
+  y: number;
+  source?: "given" | "recovered";
+};
+
+type TableRow = {
+  index: number;
+  x: number;
+  values: number[];
+};
 
 type ApiResult = {
   method: string;
@@ -46,6 +69,16 @@ type ApiResult = {
   residual?: number;
   warning?: string | null;
   derivativeMode?: string;
+  solverMode?: "iterative" | "reordered_iterative" | "direct_fallback";
+  rowOrder?: number[];
+  mode?: "evaluate" | "recover_missing";
+  points?: ResultPoint[];
+  knownPoints?: ResultPoint[];
+  missing?: { index: number; x: number; value: number } | null;
+  table?: TableRow[];
+  tableKind?: "basis" | "finite_difference" | "divided_difference";
+  h?: number;
+  p?: number;
   steps: Record<string, unknown>[];
 };
 
@@ -53,6 +86,11 @@ type Point = { x: string; y: string };
 type ThemeMode = "light" | "dark";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:5050";
+const interpolationMethodKeys = new Set<MethodKey>(["lagrange", "nfdf", "nbdf", "nfddf", "nbddf"]);
+
+function isInterpolationMethodKey(value: MethodKey) {
+  return interpolationMethodKeys.has(value);
+}
 
 function getInitialTheme(): ThemeMode {
   if (typeof window === "undefined") {
@@ -123,6 +161,34 @@ const methods: Array<{
     accent: "bg-teal-100 text-teal-700 dark:bg-teal-900 dark:text-teal-100",
     icon: Plus,
   },
+  {
+    key: "nfdf",
+    title: "NFDF",
+    short: "Newton forward difference",
+    accent: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-100",
+    icon: Workflow,
+  },
+  {
+    key: "nbdf",
+    title: "NBDF",
+    short: "Newton backward difference",
+    accent: "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-100",
+    icon: Workflow,
+  },
+  {
+    key: "nfddf",
+    title: "NFDDF",
+    short: "Forward divided difference",
+    accent: "bg-rose-100 text-rose-700 dark:bg-rose-900 dark:text-rose-100",
+    icon: Table2,
+  },
+  {
+    key: "nbddf",
+    title: "NBDDF",
+    short: "Backward divided difference",
+    accent: "bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-100",
+    icon: Table2,
+  },
 ];
 
 const initialMatrix = [
@@ -159,6 +225,72 @@ function formatVector(values: unknown) {
     return String(values ?? "");
   }
   return `[${values.map((value) => formatNumber(value)).join(", ")}]`;
+}
+
+function isFiniteResultPoint(point: unknown): point is ResultPoint {
+  if (!point || typeof point !== "object") {
+    return false;
+  }
+  const candidate = point as ResultPoint;
+  return Number.isFinite(candidate.x) && Number.isFinite(candidate.y);
+}
+
+function expandRange(min: number, max: number) {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    return [0, 1] as const;
+  }
+  if (Math.abs(max - min) < 1e-12) {
+    const span = Math.max(1, Math.abs(min));
+    return [min - span, max + span] as const;
+  }
+  const padding = (max - min) * 0.12;
+  return [min - padding, max + padding] as const;
+}
+
+function lagrangeEstimate(x: number, points: ResultPoint[]) {
+  let total = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    let basis = 1;
+    for (let j = 0; j < points.length; j += 1) {
+      if (i === j) {
+        continue;
+      }
+      const denominator = points[i].x - points[j].x;
+      if (Math.abs(denominator) < 1e-12) {
+        return Number.NaN;
+      }
+      basis *= (x - points[j].x) / denominator;
+    }
+    total += points[i].y * basis;
+  }
+  return total;
+}
+
+function pathFromPoints(points: Array<{ x: number; y: number }>, scaleX: (value: number) => number, scaleY: (value: number) => number) {
+  return points.map((point, index) => `${index === 0 ? "M" : "L"} ${scaleX(point.x).toFixed(2)} ${scaleY(point.y).toFixed(2)}`).join(" ");
+}
+
+function focusNextInput(event: KeyboardEvent<HTMLInputElement>) {
+  if (event.key !== "Enter" || event.nativeEvent.isComposing) {
+    return;
+  }
+
+  const form = event.currentTarget.form;
+  if (!form) {
+    return;
+  }
+
+  const inputs = Array.from(form.querySelectorAll<HTMLInputElement>("input:not([disabled]):not([type='hidden'])"));
+  const currentIndex = inputs.indexOf(event.currentTarget);
+  const nextInput = inputs[currentIndex + 1];
+
+  if (!nextInput) {
+    return;
+  }
+
+  event.preventDefault();
+  nextInput.focus();
+  nextInput.select();
 }
 
 function Field({
@@ -525,6 +657,7 @@ export default function App() {
   const selectedMethod = useMemo(() => methods.find((item) => item.key === method) ?? methods[0], [method]);
   const SelectedIcon = selectedMethod.icon;
   const isLinearMethod = method === "jacobi" || method === "gauss_seidel";
+  const isInterpolationMethod = isInterpolationMethodKey(method);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDarkMode);
@@ -640,15 +773,25 @@ export default function App() {
       };
     }
 
+    const interpolationPoints = points.map((point, index) => ({
+      x: parseNumber(point.x, `x${index + 1}`),
+      y: point.y.trim() === "" ? null : parseNumber(point.y, `f(x)${index + 1}`),
+    }));
+    const missingCount = interpolationPoints.filter((point) => point.y === null).length;
+    if (missingCount > 1) {
+      throw new Error("Only one f(x) value can be blank.");
+    }
+
+    const params: { points: Array<{ x: number; y: number | null }>; target?: number } = {
+      points: interpolationPoints,
+    };
+    if (missingCount === 0) {
+      params.target = parseNumber(target, "Target x");
+    }
+
     return {
       method,
-      params: {
-        points: points.map((point, index) => ({
-          x: parseNumber(point.x, `x${index + 1}`),
-          y: parseNumber(point.y, `y${index + 1}`),
-        })),
-        target: parseNumber(target, "Target x"),
-      },
+      params,
     };
   }
 
@@ -769,7 +912,7 @@ export default function App() {
                 </motion.div>
               </AnimatePresence>
 
-              {method !== "lagrange" && (
+              {!isInterpolationMethod && (
                 <div className="grid gap-4 sm:grid-cols-2">
                   <Field label="Tolerance">
                     <Input value={tolerance} onChange={(event) => setTolerance(event.target.value)} inputMode="decimal" />
@@ -852,13 +995,13 @@ export default function App() {
     }
 
     if (isLinearMethod) {
-      return <LinearSystemEditor />;
+      return renderLinearSystemEditor();
     }
 
-    return <InterpolationEditor />;
+    return renderInterpolationEditor();
   }
 
-  function LinearSystemEditor() {
+  function renderLinearSystemEditor() {
     return (
       <div className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -890,6 +1033,7 @@ export default function App() {
                       aria-label={`A ${rowIndex + 1} ${columnIndex + 1}`}
                       value={cell}
                       onChange={(event) => updateMatrix(rowIndex, columnIndex, event.target.value)}
+                      onKeyDown={focusNextInput}
                       className="h-9 text-center font-mono"
                     />
                   ))}
@@ -898,6 +1042,7 @@ export default function App() {
                     aria-label={`b ${rowIndex + 1}`}
                     value={vector[rowIndex]}
                     onChange={(event) => setVector((current) => current.map((item, itemIndex) => (itemIndex === rowIndex ? event.target.value : item)))}
+                    onKeyDown={focusNextInput}
                     className="h-9 text-center font-mono"
                   />
                 </div>
@@ -912,6 +1057,7 @@ export default function App() {
               <Input
                 value={cell}
                 onChange={(event) => setInitial((current) => current.map((item, itemIndex) => (itemIndex === index ? event.target.value : item)))}
+                onKeyDown={focusNextInput}
                 className="font-mono"
               />
             </Field>
@@ -921,14 +1067,34 @@ export default function App() {
     );
   }
 
-  function InterpolationEditor() {
+  function renderInterpolationEditor() {
+    const missingPoint = points.find((point) => point.y.trim() === "");
+
     return (
       <div className="space-y-4">
         <div className="grid gap-3">
+          <div className="grid grid-cols-[1fr_1fr_40px] gap-2 px-1 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">
+            <span>x</span>
+            <span>f(x)</span>
+            <span />
+          </div>
           {points.map((point, index) => (
             <div key={index} className="grid grid-cols-[1fr_1fr_40px] gap-2">
-              <Input aria-label={`x ${index + 1}`} value={point.x} onChange={(event) => updatePoint(index, "x", event.target.value)} />
-              <Input aria-label={`y ${index + 1}`} value={point.y} onChange={(event) => updatePoint(index, "y", event.target.value)} />
+              <Input
+                aria-label={`x ${index + 1}`}
+                value={point.x}
+                onChange={(event) => updatePoint(index, "x", event.target.value)}
+                onKeyDown={focusNextInput}
+                inputMode="decimal"
+              />
+              <Input
+                aria-label={`f(x) ${index + 1}`}
+                value={point.y}
+                onChange={(event) => updatePoint(index, "y", event.target.value)}
+                onKeyDown={focusNextInput}
+                inputMode="decimal"
+                placeholder="missing"
+              />
               <Button
                 type="button"
                 variant="outline"
@@ -947,8 +1113,14 @@ export default function App() {
             <Plus className="h-4 w-4" />
             Add point
           </Button>
-          <Field label="Target x" className="sm:min-w-[220px]">
-            <Input value={target} onChange={(event) => setTarget(event.target.value)} inputMode="decimal" />
+          <Field label={missingPoint ? "Missing x" : "Target x"} className="sm:min-w-[220px]">
+            <Input
+              value={missingPoint ? missingPoint.x : target}
+              onChange={(event) => setTarget(event.target.value)}
+              onKeyDown={focusNextInput}
+              inputMode="decimal"
+              disabled={Boolean(missingPoint)}
+            />
           </Field>
         </div>
       </div>
@@ -979,6 +1151,7 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
     );
   }
 
+  const isInterpolation = isInterpolationMethodKey(method);
   const primaryValue =
     result.solution !== undefined
       ? formatVector(result.solution)
@@ -995,15 +1168,31 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
           <div>
             <h2 className="text-lg font-semibold text-slate-950 dark:text-slate-50">{result.method}</h2>
             <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-300">
+              {result.mode === "recover_missing" && (
+                <span className="inline-flex items-center gap-1 rounded-md bg-emerald-100 px-2 py-1 text-xs font-semibold text-emerald-700 dark:bg-emerald-900 dark:text-emerald-100">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  Missing f(x) recovered
+                </span>
+              )}
               {method === "newton" && result.derivativeMode === "auto" && (
                 <span className="inline-flex items-center gap-1 rounded-md bg-sky-100 px-2 py-1 text-xs font-semibold text-sky-700 dark:bg-sky-900 dark:text-sky-100">
                   Auto derivative
                 </span>
               )}
-              {typeof result.converged === "boolean" && (
+              {result.solverMode === "direct_fallback" ? (
+                <span className="inline-flex items-center gap-1 rounded-md bg-emerald-100 px-2 py-1 text-xs font-semibold text-emerald-700 dark:bg-emerald-900 dark:text-emerald-100">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  Direct solve
+                </span>
+              ) : typeof result.converged === "boolean" ? (
                 <span className={cn("inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold", result.converged ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-100" : "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-100")}>
                   <CheckCircle2 className="h-3.5 w-3.5" />
                   {result.converged ? "Converged" : "Max iterations"}
+                </span>
+              ) : null}
+              {result.solverMode === "reordered_iterative" && (
+                <span className="rounded-md bg-sky-100 px-2 py-1 text-xs font-semibold text-sky-700 dark:bg-sky-900 dark:text-sky-100">
+                  Rows reordered
                 </span>
               )}
               {result.warning && <span className="rounded-md bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-800 dark:bg-amber-900 dark:text-amber-100">{result.warning}</span>}
@@ -1012,9 +1201,9 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
         </div>
 
         <div className="mt-4 grid gap-3 md:grid-cols-3">
-          <Metric label={result.solution ? "Solution" : method === "lagrange" ? "P(x)" : method === "iteration" ? "Fixed point" : "Root"} value={primaryValue} />
-          <Metric label="Iterations" value={result.iterations ?? result.steps.length} />
-          <Metric label={result.residual !== undefined ? "Residual" : "Value"} value={formatNumber(result.residual ?? result.value ?? "")} />
+          <Metric label={result.solution ? "Solution" : result.missing ? "Recovered f(x)" : isInterpolation ? "P(x)" : method === "iteration" ? "Fixed point" : "Root"} value={primaryValue} />
+          <Metric label={isInterpolation ? "Terms" : "Iterations"} value={result.iterations ?? result.steps.length} />
+          <Metric label={isInterpolation ? "Target x" : result.residual !== undefined ? "Residual" : "Value"} value={formatNumber(isInterpolation ? result.target : result.residual ?? result.value ?? "")} />
         </div>
 
         {result.polynomial && (
@@ -1025,6 +1214,8 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
         )}
       </div>
 
+      {isInterpolation && <InterpolationVisuals result={result} />}
+
       <div className="rounded-md border border-slate-200 bg-white shadow-panel dark:border-slate-700 dark:bg-slate-900">
         <div className="border-b border-slate-200 p-4 dark:border-slate-700">
           <h2 className="text-lg font-semibold text-slate-950 dark:text-slate-50">Steps</h2>
@@ -1034,6 +1225,200 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
         </div>
       </div>
     </section>
+  );
+}
+
+function InterpolationVisuals({ result }: { result: ApiResult }) {
+  const resultPoints = (result.points ?? []).filter(isFiniteResultPoint);
+  const knownPoints = (result.knownPoints ?? []).filter(isFiniteResultPoint);
+  const curvePoints = knownPoints.length >= 2 ? knownPoints : resultPoints.filter((point) => point.source !== "recovered");
+  const targetPoint =
+    typeof result.target === "number" && typeof result.value === "number" && Number.isFinite(result.target) && Number.isFinite(result.value)
+      ? { x: result.target, y: result.value }
+      : null;
+
+  if (curvePoints.length < 2 && resultPoints.length < 2) {
+    return null;
+  }
+
+  const plottedPoints = resultPoints.length > 0 ? resultPoints : curvePoints;
+  const xValues = [...plottedPoints.map((point) => point.x), ...(targetPoint ? [targetPoint.x] : [])];
+  const rawMinX = Math.min(...xValues);
+  const rawMaxX = Math.max(...xValues);
+  const [minX, maxX] = expandRange(rawMinX, rawMaxX);
+  const samples =
+    curvePoints.length >= 2
+      ? Array.from({ length: 96 }, (_, index) => {
+          const x = minX + ((maxX - minX) * index) / 95;
+          return { x, y: lagrangeEstimate(x, curvePoints) };
+        }).filter((point) => Number.isFinite(point.y))
+      : [];
+  const yValues = [
+    ...plottedPoints.map((point) => point.y),
+    ...samples.map((point) => point.y),
+    ...(targetPoint ? [targetPoint.y] : []),
+  ];
+  const [minY, maxY] = expandRange(Math.min(...yValues), Math.max(...yValues));
+  const width = 720;
+  const height = 300;
+  const left = 54;
+  const right = 24;
+  const top = 22;
+  const bottom = 42;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const scaleX = (value: number) => left + ((value - minX) / (maxX - minX)) * plotWidth;
+  const scaleY = (value: number) => top + (1 - (value - minY) / (maxY - minY)) * plotHeight;
+  const curvePath = samples.length > 1 ? pathFromPoints(samples, scaleX, scaleY) : "";
+  const ticks = Array.from({ length: 5 }, (_, index) => index / 4);
+  const termSteps = result.steps
+    .map((step, index) => ({ index, term: typeof step.term === "number" ? step.term : Number.NaN }))
+    .filter((step) => Number.isFinite(step.term));
+  const maxTerm = Math.max(1e-12, ...termSteps.map((step) => Math.abs(step.term)));
+
+  return (
+    <div className="rounded-md border border-slate-200 bg-white shadow-panel dark:border-slate-700 dark:bg-slate-900">
+      <div className="border-b border-slate-200 p-4 dark:border-slate-700">
+        <h2 className="text-lg font-semibold text-slate-950 dark:text-slate-50">Visuals</h2>
+      </div>
+
+      <div className="grid gap-5 p-4 xl:grid-cols-[minmax(0,1.25fr)_minmax(300px,0.75fr)]">
+        <div className="min-w-0">
+          <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Curve and points</div>
+          <div className="overflow-hidden rounded-md border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-950">
+            <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Interpolation curve" className="h-auto w-full">
+              <rect x="0" y="0" width={width} height={height} className="fill-slate-50 dark:fill-slate-950" />
+              {ticks.map((tick) => {
+                const x = left + tick * plotWidth;
+                const y = top + tick * plotHeight;
+                const xValue = minX + tick * (maxX - minX);
+                const yValue = maxY - tick * (maxY - minY);
+                return (
+                  <g key={`tick-${tick}`}>
+                    <line x1={x} x2={x} y1={top} y2={top + plotHeight} className="stroke-slate-200 dark:stroke-slate-800" strokeWidth="1" />
+                    <line x1={left} x2={left + plotWidth} y1={y} y2={y} className="stroke-slate-200 dark:stroke-slate-800" strokeWidth="1" />
+                    <text x={x} y={height - 15} textAnchor="middle" className="fill-slate-500 text-[11px] dark:fill-slate-300">
+                      {formatNumber(xValue)}
+                    </text>
+                    <text x={left - 10} y={y + 4} textAnchor="end" className="fill-slate-500 text-[11px] dark:fill-slate-300">
+                      {formatNumber(yValue)}
+                    </text>
+                  </g>
+                );
+              })}
+              <line x1={left} x2={left} y1={top} y2={top + plotHeight} className="stroke-slate-400 dark:stroke-slate-600" strokeWidth="1.5" />
+              <line x1={left} x2={left + plotWidth} y1={top + plotHeight} y2={top + plotHeight} className="stroke-slate-400 dark:stroke-slate-600" strokeWidth="1.5" />
+              {curvePath && <path d={curvePath} fill="none" className="stroke-blue-600 dark:stroke-sky-300" strokeWidth="3" strokeLinecap="round" />}
+              {plottedPoints.map((point, index) => {
+                const cx = scaleX(point.x);
+                const cy = scaleY(point.y);
+                const recovered = point.source === "recovered";
+                return (
+                  <g key={`${point.x}-${point.y}-${index}`}>
+                    {recovered ? (
+                      <rect
+                        x={cx - 5}
+                        y={cy - 5}
+                        width="10"
+                        height="10"
+                        transform={`rotate(45 ${cx} ${cy})`}
+                        className="fill-emerald-500 stroke-white dark:stroke-slate-950"
+                        strokeWidth="2"
+                      />
+                    ) : (
+                      <circle cx={cx} cy={cy} r="5" className="fill-slate-900 stroke-white dark:fill-sky-200 dark:stroke-slate-950" strokeWidth="2" />
+                    )}
+                    <title>
+                      {recovered ? "recovered" : "given"} ({formatNumber(point.x)}, {formatNumber(point.y)})
+                    </title>
+                  </g>
+                );
+              })}
+              {targetPoint && !result.missing && (
+                <g>
+                  <line x1={scaleX(targetPoint.x)} x2={scaleX(targetPoint.x)} y1={top} y2={top + plotHeight} className="stroke-amber-500" strokeDasharray="6 6" strokeWidth="2" />
+                  <circle cx={scaleX(targetPoint.x)} cy={scaleY(targetPoint.y)} r="6" className="fill-amber-500 stroke-white dark:stroke-slate-950" strokeWidth="2" />
+                  <title>
+                    target ({formatNumber(targetPoint.x)}, {formatNumber(targetPoint.y)})
+                  </title>
+                </g>
+              )}
+            </svg>
+          </div>
+        </div>
+
+        <div className="min-w-0 space-y-5">
+          <DifferenceTableView rows={result.table ?? []} kind={result.tableKind} />
+          {termSteps.length > 0 && (
+            <div>
+              <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Term contribution</div>
+              <div className="space-y-2">
+                {termSteps.map((step) => (
+                  <div key={step.index} className="grid grid-cols-[44px_minmax(0,1fr)_96px] items-center gap-3 text-xs">
+                    <span className="font-mono text-slate-500 dark:text-slate-300">k={step.index}</span>
+                    <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                      <div
+                        className={cn("h-full rounded-full", step.term >= 0 ? "bg-blue-600 dark:bg-sky-300" : "bg-rose-500")}
+                        style={{ width: `${Math.max(3, (Math.abs(step.term) / maxTerm) * 100)}%` }}
+                      />
+                    </div>
+                    <span className="overflow-hidden text-ellipsis whitespace-nowrap text-right font-mono text-slate-700 dark:text-slate-100">{formatNumber(step.term)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DifferenceTableView({ rows, kind }: { rows: TableRow[]; kind?: ApiResult["tableKind"] }) {
+  if (!rows.length || kind === "basis") {
+    return null;
+  }
+
+  const maxValues = Math.max(...rows.map((row) => row.values.length));
+  const headers = Array.from({ length: maxValues }, (_, index) => {
+    if (index === 0) {
+      return "f(x)";
+    }
+    return kind === "finite_difference" ? `Δ${index}` : `DD${index}`;
+  });
+
+  return (
+    <div>
+      <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">
+        {kind === "finite_difference" ? "Difference table" : "Divided difference table"}
+      </div>
+      <div className="overflow-auto rounded-md border border-slate-200 dark:border-slate-700">
+        <table className="w-full min-w-[420px] border-collapse text-left text-xs">
+          <thead className="bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-100">
+            <tr>
+              <th className="border-b border-slate-200 px-3 py-2 font-semibold dark:border-slate-700">x</th>
+              {headers.map((header) => (
+                <th key={header} className="border-b border-slate-200 px-3 py-2 font-semibold dark:border-slate-700">
+                  {header}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={`${row.index}-${row.x}`} className="odd:bg-white even:bg-slate-50 dark:odd:bg-slate-900 dark:even:bg-slate-800/60">
+                <td className="border-b border-slate-200 px-3 py-2 font-mono text-slate-700 dark:border-slate-700 dark:text-slate-100">{formatNumber(row.x)}</td>
+                {headers.map((_header, index) => (
+                  <td key={index} className="border-b border-slate-200 px-3 py-2 font-mono text-slate-700 dark:border-slate-700 dark:text-slate-100">
+                    {row.values[index] === undefined ? "" : formatNumber(row.values[index])}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -1094,6 +1479,38 @@ function StepTable({ method, steps }: { method: MethodKey; steps: Record<string,
       { label: "y", key: "y" },
       { label: "L_i(x)", key: "basis" },
       { label: "term", key: "term" },
+    ],
+    nfdf: [
+      { label: "k", key: "order" },
+      { label: "Δ^k", key: "difference" },
+      { label: "p term", key: "pTerm" },
+      { label: "coefficient", key: "coefficient" },
+      { label: "term", key: "term" },
+      { label: "partial", key: "partial" },
+    ],
+    nbdf: [
+      { label: "k", key: "order" },
+      { label: "∇^k", key: "difference" },
+      { label: "p term", key: "pTerm" },
+      { label: "coefficient", key: "coefficient" },
+      { label: "term", key: "term" },
+      { label: "partial", key: "partial" },
+    ],
+    nfddf: [
+      { label: "k", key: "order" },
+      { label: "x anchor", key: "xAnchor" },
+      { label: "divided diff", key: "dividedDifference" },
+      { label: "product", key: "product" },
+      { label: "term", key: "term" },
+      { label: "partial", key: "partial" },
+    ],
+    nbddf: [
+      { label: "k", key: "order" },
+      { label: "x anchor", key: "xAnchor" },
+      { label: "divided diff", key: "dividedDifference" },
+      { label: "product", key: "product" },
+      { label: "term", key: "term" },
+      { label: "partial", key: "partial" },
     ],
   };
 

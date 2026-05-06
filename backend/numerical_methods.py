@@ -53,6 +53,8 @@ ALLOWED_NODES = (
     ast.UAdd,
 )
 
+PIVOT_TOLERANCE = 1e-12
+
 
 def _ensure_number(value: Any, name: str) -> float:
     try:
@@ -525,10 +527,6 @@ def _validate_linear_system(params: dict[str, Any]) -> tuple[list[list[float]], 
     else:
         raise NumericalError("initial vector length must match matrix size.")
 
-    for i in range(size):
-        if abs(matrix[i][i]) < 1e-15:
-            raise NumericalError(f"Diagonal value A[{i + 1},{i + 1}] cannot be zero.")
-
     tolerance = _ensure_positive_number(params.get("tolerance", 1e-6), "tolerance")
     max_iterations = _ensure_iterations(params.get("maxIterations", 50))
     return matrix, vector, initial, tolerance, max_iterations
@@ -542,102 +540,264 @@ def _residual_norm(matrix: list[list[float]], vector: list[float], x_values: lis
     return max(residuals)
 
 
-def _diagonal_dominance_warning(matrix: list[list[float]]) -> str | None:
-    weakly_dominant = True
-    strictly_dominant_row = False
+def _row_off_diagonal_sum(row: list[float], diagonal_index: int) -> float:
+    return sum(abs(value) for j, value in enumerate(row) if j != diagonal_index)
+
+
+def _is_row_strictly_dominant(row: list[float], diagonal_index: int) -> bool:
+    diagonal = abs(row[diagonal_index])
+    return diagonal > PIVOT_TOLERANCE and diagonal > _row_off_diagonal_sum(row, diagonal_index) + PIVOT_TOLERANCE
+
+
+def _is_row_weakly_dominant(row: list[float], diagonal_index: int) -> bool:
+    diagonal = abs(row[diagonal_index])
+    return diagonal > PIVOT_TOLERANCE and diagonal + PIVOT_TOLERANCE >= _row_off_diagonal_sum(row, diagonal_index)
+
+
+def _is_diagonally_dominant(matrix: list[list[float]]) -> bool:
+    if not matrix:
+        return False
+    has_strict_row = False
     for i, row in enumerate(matrix):
-        diagonal = abs(row[i])
-        off_diagonal = sum(abs(value) for j, value in enumerate(row) if j != i)
-        if diagonal < off_diagonal:
-            weakly_dominant = False
-        if diagonal > off_diagonal:
-            strictly_dominant_row = True
-    if not weakly_dominant or not strictly_dominant_row:
+        if not _is_row_weakly_dominant(row, i):
+            return False
+        if _is_row_strictly_dominant(row, i):
+            has_strict_row = True
+    return has_strict_row
+
+
+def _diagonal_dominance_warning(matrix: list[list[float]]) -> str | None:
+    if not _is_diagonally_dominant(matrix):
         return "The matrix is not strictly diagonally dominant; convergence is not guaranteed."
     return None
 
 
-def jacobi_method(params: dict[str, Any]) -> dict[str, Any]:
-    matrix, vector, x_old, tolerance, max_iterations = _validate_linear_system(params)
-    steps: list[dict[str, Any]] = []
-    solution = x_old[:]
-    converged = False
+def _find_row_order(
+    matrix: list[list[float]],
+    is_usable_row: Callable[[list[float], int], bool],
+) -> list[int] | None:
+    size = len(matrix)
+    row_order = [-1] * size
+    used_rows: set[int] = set()
+    columns = sorted(
+        range(size),
+        key=lambda column: sum(1 for row in matrix if is_usable_row(row, column)),
+    )
 
-    for iteration in range(1, max_iterations + 1):
-        x_new = []
-        for i, row in enumerate(matrix):
-            sigma = sum(row[j] * x_old[j] for j in range(len(row)) if j != i)
-            x_new.append((vector[i] - sigma) / row[i])
+    def assign(column_index: int) -> bool:
+        if column_index == size:
+            return True
 
-        error = max(abs(x_new[i] - x_old[i]) for i in range(len(x_new)))
-        residual = _residual_norm(matrix, vector, x_new)
-        steps.append(
-            {
-                "iteration": iteration,
-                "previous": x_old[:],
-                "current": x_new[:],
-                "error": error,
-                "residual": residual,
-            }
-        )
-        solution = x_new
-        if error <= tolerance or residual <= tolerance:
-            converged = True
-            break
-        x_old = x_new
+        column = columns[column_index]
+        candidates = [
+            row_index
+            for row_index, row in enumerate(matrix)
+            if row_index not in used_rows and is_usable_row(row, column)
+        ]
+        candidates.sort(key=lambda row_index: abs(matrix[row_index][column]), reverse=True)
 
+        for row_index in candidates:
+            row_order[column] = row_index
+            used_rows.add(row_index)
+            if assign(column_index + 1):
+                return True
+            used_rows.remove(row_index)
+            row_order[column] = -1
+
+        return False
+
+    if assign(0):
+        return row_order
+    return None
+
+
+def _find_diagonally_dominant_row_order(matrix: list[list[float]]) -> list[int] | None:
+    strict_order = _find_row_order(matrix, _is_row_strictly_dominant)
+    if strict_order is not None:
+        return strict_order
+
+    weak_order = _find_row_order(matrix, _is_row_weakly_dominant)
+    if weak_order is None:
+        return None
+    if any(_is_row_strictly_dominant(matrix[row_index], column) for column, row_index in enumerate(weak_order)):
+        return weak_order
+    return None
+
+
+def _find_nonzero_diagonal_row_order(matrix: list[list[float]]) -> list[int] | None:
+    return _find_row_order(matrix, lambda row, column: abs(row[column]) > PIVOT_TOLERANCE)
+
+
+def _reorder_linear_system(
+    matrix: list[list[float]],
+    vector: list[float],
+    row_order: list[int],
+) -> tuple[list[list[float]], list[float]]:
+    return [matrix[row_index][:] for row_index in row_order], [vector[row_index] for row_index in row_order]
+
+
+def _prepare_linear_iteration_system(
+    matrix: list[list[float]],
+    vector: list[float],
+) -> tuple[list[list[float]], list[float], list[int], str | None, bool, bool]:
+    identity_order = list(range(len(matrix)))
+    dominant_order = _find_diagonally_dominant_row_order(matrix)
+
+    if dominant_order is not None:
+        prepared_matrix, prepared_vector = _reorder_linear_system(matrix, vector, dominant_order)
+        return prepared_matrix, prepared_vector, dominant_order, None, True, True
+
+    if all(abs(row[index]) > PIVOT_TOLERANCE for index, row in enumerate(matrix)):
+        return matrix, vector, identity_order, _diagonal_dominance_warning(matrix), False, True
+
+    nonzero_order = _find_nonzero_diagonal_row_order(matrix)
+    if nonzero_order is None:
+        return matrix, vector, identity_order, _diagonal_dominance_warning(matrix), False, False
+
+    prepared_matrix, prepared_vector = _reorder_linear_system(matrix, vector, nonzero_order)
+    return prepared_matrix, prepared_vector, nonzero_order, _diagonal_dominance_warning(prepared_matrix), False, True
+
+
+def _solve_linear_system_direct(matrix: list[list[float]], vector: list[float]) -> list[float]:
+    size = len(matrix)
+    augmented = [row[:] + [vector[index]] for index, row in enumerate(matrix)]
+
+    for pivot_column in range(size):
+        pivot_row = max(range(pivot_column, size), key=lambda row_index: abs(augmented[row_index][pivot_column]))
+        if abs(augmented[pivot_row][pivot_column]) <= PIVOT_TOLERANCE:
+            raise NumericalError("Linear system is singular; a unique solution could not be found.")
+
+        if pivot_row != pivot_column:
+            augmented[pivot_column], augmented[pivot_row] = augmented[pivot_row], augmented[pivot_column]
+
+        pivot = augmented[pivot_column][pivot_column]
+        for row_index in range(pivot_column + 1, size):
+            factor = augmented[row_index][pivot_column] / pivot
+            if abs(factor) <= PIVOT_TOLERANCE:
+                continue
+            for column_index in range(pivot_column, size + 1):
+                augmented[row_index][column_index] -= factor * augmented[pivot_column][column_index]
+
+    solution = [0.0] * size
+    for row_index in range(size - 1, -1, -1):
+        pivot = augmented[row_index][row_index]
+        if abs(pivot) <= PIVOT_TOLERANCE:
+            raise NumericalError("Linear system is singular; a unique solution could not be found.")
+        known_sum = sum(augmented[row_index][column_index] * solution[column_index] for column_index in range(row_index + 1, size))
+        solution[row_index] = (augmented[row_index][size] - known_sum) / pivot
+
+    return solution
+
+
+def _linear_result(
+    method_name: str,
+    original_matrix: list[list[float]],
+    original_vector: list[float],
+    solution: list[float],
+    steps: list[dict[str, Any]],
+    converged: bool,
+    tolerance: float,
+    warning: str | None,
+    row_order: list[int],
+    solver_mode: str,
+) -> dict[str, Any]:
     return {
-        "method": "Jacobi Method",
+        "method": method_name,
         "solution": solution,
         "iterations": len(steps),
         "converged": converged,
         "tolerance": tolerance,
-        "residual": _residual_norm(matrix, vector, solution),
-        "warning": _diagonal_dominance_warning(matrix),
+        "residual": _residual_norm(original_matrix, original_vector, solution),
+        "warning": warning,
+        "solverMode": solver_mode,
+        "rowOrder": [row_index + 1 for row_index in row_order],
         "steps": steps,
     }
+
+
+def jacobi_method(params: dict[str, Any]) -> dict[str, Any]:
+    matrix, vector, x_old, tolerance, max_iterations = _validate_linear_system(params)
+    original_matrix = [row[:] for row in matrix]
+    original_vector = vector[:]
+    matrix, vector, row_order, warning, is_dominant, can_iterate = _prepare_linear_iteration_system(matrix, vector)
+    steps: list[dict[str, Any]] = []
+    solution = x_old[:]
+    converged = False
+
+    if can_iterate:
+        for iteration in range(1, max_iterations + 1):
+            x_new = []
+            for i, row in enumerate(matrix):
+                sigma = sum(row[j] * x_old[j] for j in range(len(row)) if j != i)
+                x_new.append((vector[i] - sigma) / row[i])
+
+            error = max(abs(x_new[i] - x_old[i]) for i in range(len(x_new)))
+            residual = _residual_norm(matrix, vector, x_new)
+            steps.append(
+                {
+                    "iteration": iteration,
+                    "previous": x_old[:],
+                    "current": x_new[:],
+                    "error": error,
+                    "residual": residual,
+                }
+            )
+            solution = x_new
+            if error <= tolerance or residual <= tolerance:
+                converged = True
+                break
+            x_old = x_new
+
+    solver_mode = "reordered_iterative" if row_order != list(range(len(matrix))) and is_dominant else "iterative"
+    if not converged and not is_dominant:
+        solution = _solve_linear_system_direct(original_matrix, original_vector)
+        solver_mode = "direct_fallback"
+        warning = "Could not make the matrix diagonally dominant by swapping rows; returned the direct linear-system solution."
+
+    return _linear_result("Jacobi Method", original_matrix, original_vector, solution, steps, converged, tolerance, warning, row_order, solver_mode)
 
 
 def gauss_seidel_method(params: dict[str, Any]) -> dict[str, Any]:
     matrix, vector, x_old, tolerance, max_iterations = _validate_linear_system(params)
+    original_matrix = [row[:] for row in matrix]
+    original_vector = vector[:]
+    matrix, vector, row_order, warning, is_dominant, can_iterate = _prepare_linear_iteration_system(matrix, vector)
     steps: list[dict[str, Any]] = []
     solution = x_old[:]
     converged = False
 
-    for iteration in range(1, max_iterations + 1):
-        x_new = x_old[:]
-        for i, row in enumerate(matrix):
-            before = sum(row[j] * x_new[j] for j in range(i))
-            after = sum(row[j] * x_old[j] for j in range(i + 1, len(row)))
-            x_new[i] = (vector[i] - before - after) / row[i]
+    if can_iterate:
+        for iteration in range(1, max_iterations + 1):
+            x_new = x_old[:]
+            for i, row in enumerate(matrix):
+                before = sum(row[j] * x_new[j] for j in range(i))
+                after = sum(row[j] * x_old[j] for j in range(i + 1, len(row)))
+                x_new[i] = (vector[i] - before - after) / row[i]
 
-        error = max(abs(x_new[i] - x_old[i]) for i in range(len(x_new)))
-        residual = _residual_norm(matrix, vector, x_new)
-        steps.append(
-            {
-                "iteration": iteration,
-                "previous": x_old[:],
-                "current": x_new[:],
-                "error": error,
-                "residual": residual,
-            }
-        )
-        solution = x_new
-        if error <= tolerance or residual <= tolerance:
-            converged = True
-            break
-        x_old = x_new
+            error = max(abs(x_new[i] - x_old[i]) for i in range(len(x_new)))
+            residual = _residual_norm(matrix, vector, x_new)
+            steps.append(
+                {
+                    "iteration": iteration,
+                    "previous": x_old[:],
+                    "current": x_new[:],
+                    "error": error,
+                    "residual": residual,
+                }
+            )
+            solution = x_new
+            if error <= tolerance or residual <= tolerance:
+                converged = True
+                break
+            x_old = x_new
 
-    return {
-        "method": "Gauss-Seidel Method",
-        "solution": solution,
-        "iterations": len(steps),
-        "converged": converged,
-        "tolerance": tolerance,
-        "residual": _residual_norm(matrix, vector, solution),
-        "warning": _diagonal_dominance_warning(matrix),
-        "steps": steps,
-    }
+    solver_mode = "reordered_iterative" if row_order != list(range(len(matrix))) and is_dominant else "iterative"
+    if not converged and not is_dominant:
+        solution = _solve_linear_system_direct(original_matrix, original_vector)
+        solver_mode = "direct_fallback"
+        warning = "Could not make the matrix diagonally dominant by swapping rows; returned the direct linear-system solution."
+
+    return _linear_result("Gauss-Seidel Method", original_matrix, original_vector, solution, steps, converged, tolerance, warning, row_order, solver_mode)
 
 
 def _poly_multiply(left: list[float], right: list[float]) -> list[float]:
@@ -669,23 +829,201 @@ def _format_polynomial(coefficients: list[float]) -> str:
     return polynomial[2:] if polynomial.startswith("+ ") else polynomial
 
 
-def lagrange_interpolation(params: dict[str, Any]) -> dict[str, Any]:
-    raw_points = params.get("points")
-    target = _ensure_number(params.get("target"), "target")
+def _is_missing_point_value(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _parse_interpolation_points(
+    raw_points: Any,
+    *,
+    allow_missing: bool = True,
+) -> tuple[list[tuple[float, float | None]], int | None]:
     if not isinstance(raw_points, list) or len(raw_points) < 2:
         raise NumericalError("At least two interpolation points are required.")
 
-    points: list[tuple[float, float]] = []
+    points: list[tuple[float, float | None]] = []
+    missing_indices: list[int] = []
     seen_x: set[float] = set()
+
     for index, point in enumerate(raw_points):
         if not isinstance(point, dict):
             raise NumericalError("Each point must contain x and y.")
         x_value = _ensure_number(point.get("x"), f"x[{index + 1}]")
-        y_value = _ensure_number(point.get("y"), f"y[{index + 1}]")
         if x_value in seen_x:
             raise NumericalError("Interpolation x values must be distinct.")
         seen_x.add(x_value)
+
+        raw_y = point.get("y")
+        if _is_missing_point_value(raw_y):
+            if not allow_missing:
+                raise NumericalError(f"y[{index + 1}] must be a number.")
+            missing_indices.append(index)
+            y_value = None
+        else:
+            y_value = _ensure_number(raw_y, f"y[{index + 1}]")
+
         points.append((x_value, y_value))
+
+    if len(missing_indices) > 1:
+        raise NumericalError("Only one missing f(x) value can be recovered at a time.")
+
+    known_count = sum(1 for _x, y_value in points if y_value is not None)
+    if known_count < 2:
+        raise NumericalError("At least two known f(x) values are required.")
+
+    return points, missing_indices[0] if missing_indices else None
+
+
+def _prepare_interpolation_data(params: dict[str, Any]) -> tuple[list[tuple[float, float]], float, int | None, list[tuple[float, float | None]]]:
+    parsed_points, missing_index = _parse_interpolation_points(params.get("points"))
+    if missing_index is None:
+        target = _ensure_number(params.get("target"), "target")
+    else:
+        target = parsed_points[missing_index][0]
+
+    known_points = [(x_value, y_value) for x_value, y_value in parsed_points if y_value is not None]
+    return known_points, target, missing_index, parsed_points
+
+
+def _sorted_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    return sorted(points, key=lambda point: point[0])
+
+
+def _result_points(
+    parsed_points: list[tuple[float, float | None]],
+    missing_index: int | None,
+    recovered_value: float,
+) -> list[dict[str, float | str]]:
+    result_points: list[dict[str, float | str]] = []
+    for index, (x_value, y_value) in enumerate(parsed_points):
+        is_missing = index == missing_index
+        result_points.append(
+            {
+                "x": x_value,
+                "y": recovered_value if is_missing else float(y_value),
+                "source": "recovered" if is_missing else "given",
+            }
+        )
+    return result_points
+
+
+def _newton_standard_coefficients(points: list[tuple[float, float]], newton_coefficients: list[float]) -> list[float]:
+    coefficients = [0.0] * len(newton_coefficients)
+    basis = [1.0]
+
+    for order, coefficient in enumerate(newton_coefficients):
+        for power, basis_coefficient in enumerate(basis):
+            coefficients[power] += coefficient * basis_coefficient
+        if order < len(newton_coefficients) - 1:
+            basis = _poly_multiply(basis, [-points[order][0], 1.0])
+
+    return coefficients
+
+
+def _finite_difference_table(points: list[tuple[float, float]]) -> list[list[float | None]]:
+    table: list[list[float | None]] = [[None for _column in points] for _row in points]
+    for row, (_x_value, y_value) in enumerate(points):
+        table[row][0] = y_value
+
+    for order in range(1, len(points)):
+        for row in range(len(points) - order):
+            previous_next = table[row + 1][order - 1]
+            previous_current = table[row][order - 1]
+            if previous_next is None or previous_current is None:
+                raise NumericalError("Difference table could not be constructed.")
+            table[row][order] = previous_next - previous_current
+
+    return table
+
+
+def _divided_difference_table(points: list[tuple[float, float]]) -> list[list[float | None]]:
+    table: list[list[float | None]] = [[None for _column in points] for _row in points]
+    for row, (_x_value, y_value) in enumerate(points):
+        table[row][0] = y_value
+
+    for order in range(1, len(points)):
+        for row in range(len(points) - order):
+            denominator = points[row + order][0] - points[row][0]
+            if abs(denominator) <= PIVOT_TOLERANCE:
+                raise NumericalError("Interpolation x values must be distinct.")
+            previous_next = table[row + 1][order - 1]
+            previous_current = table[row][order - 1]
+            if previous_next is None or previous_current is None:
+                raise NumericalError("Divided difference table could not be constructed.")
+            table[row][order] = (previous_next - previous_current) / denominator
+
+    return table
+
+
+def _table_rows(points: list[tuple[float, float]], table: list[list[float | None]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, (x_value, _y_value) in enumerate(points):
+        rows.append(
+            {
+                "index": index + 1,
+                "x": x_value,
+                "values": [value for value in table[index] if value is not None],
+            }
+        )
+    return rows
+
+
+def _validate_equal_spacing(points: list[tuple[float, float]]) -> float:
+    if len(points) < 2:
+        raise NumericalError("At least two interpolation points are required.")
+
+    h = points[1][0] - points[0][0]
+    if abs(h) <= PIVOT_TOLERANCE:
+        raise NumericalError("Interpolation x values must be distinct.")
+
+    tolerance = max(1.0, abs(h)) * 1e-9
+    for index in range(2, len(points)):
+        spacing = points[index][0] - points[index - 1][0]
+        if abs(spacing - h) > tolerance:
+            raise NumericalError("NFDF and NBDF require equally spaced known x values. Use NFDDF or NBDDF for non-uniform points.")
+
+    return h
+
+
+def _interpolation_result(
+    *,
+    method_name: str,
+    target: float,
+    value: float,
+    known_points: list[tuple[float, float]],
+    parsed_points: list[tuple[float, float | None]],
+    missing_index: int | None,
+    polynomial: str,
+    steps: list[dict[str, Any]],
+    table_rows: list[dict[str, Any]],
+    table_kind: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "method": method_name,
+        "target": target,
+        "value": value,
+        "polynomial": polynomial,
+        "mode": "recover_missing" if missing_index is not None else "evaluate",
+        "points": _result_points(parsed_points, missing_index, value),
+        "knownPoints": [{"x": x_value, "y": y_value} for x_value, y_value in known_points],
+        "table": table_rows,
+        "tableKind": table_kind,
+        "steps": steps,
+    }
+    if missing_index is not None:
+        result["missing"] = {
+            "index": missing_index + 1,
+            "x": target,
+            "value": value,
+        }
+    if extra:
+        result.update(extra)
+    return result
+
+
+def lagrange_interpolation(params: dict[str, Any]) -> dict[str, Any]:
+    points, target, missing_index, parsed_points = _prepare_interpolation_data(params)
 
     total = 0.0
     steps: list[dict[str, Any]] = []
@@ -737,8 +1075,189 @@ def lagrange_interpolation(params: dict[str, Any]) -> dict[str, Any]:
         "target": target,
         "value": total,
         "polynomial": _format_polynomial(coefficients),
+        "mode": "recover_missing" if missing_index is not None else "evaluate",
+        "points": _result_points(parsed_points, missing_index, total),
+        "knownPoints": [{"x": x_value, "y": y_value} for x_value, y_value in points],
+        "table": [],
+        "tableKind": "basis",
+        "missing": {
+            "index": missing_index + 1,
+            "x": target,
+            "value": total,
+        } if missing_index is not None else None,
         "steps": steps,
     }
+
+
+def newton_forward_difference_formula(params: dict[str, Any]) -> dict[str, Any]:
+    known_points, target, missing_index, parsed_points = _prepare_interpolation_data(params)
+    points = _sorted_points(known_points)
+    h = _validate_equal_spacing(points)
+    table = _finite_difference_table(points)
+    p = (target - points[0][0]) / h
+    steps: list[dict[str, Any]] = []
+    total = 0.0
+    p_term = 1.0
+    factorial = 1.0
+
+    for order in range(len(points)):
+        difference = table[0][order]
+        if difference is None:
+            raise NumericalError("Forward difference table could not be evaluated.")
+        if order > 0:
+            p_term *= p - (order - 1)
+            factorial *= order
+        multiplier = p_term / factorial
+        term = multiplier * difference
+        total += term
+        steps.append(
+            {
+                "iteration": order,
+                "order": order,
+                "difference": difference,
+                "pTerm": p_term,
+                "factorial": factorial,
+                "coefficient": multiplier,
+                "term": term,
+                "partial": total,
+            }
+        )
+
+    divided_table = _divided_difference_table(points)
+    newton_coefficients = [float(divided_table[0][order]) for order in range(len(points))]
+    coefficients = _newton_standard_coefficients(points, newton_coefficients)
+
+    return _interpolation_result(
+        method_name="Newton Forward Difference Formula",
+        target=target,
+        value=total,
+        known_points=points,
+        parsed_points=parsed_points,
+        missing_index=missing_index,
+        polynomial=_format_polynomial(coefficients),
+        steps=steps,
+        table_rows=_table_rows(points, table),
+        table_kind="finite_difference",
+        extra={"h": h, "p": p},
+    )
+
+
+def newton_backward_difference_formula(params: dict[str, Any]) -> dict[str, Any]:
+    known_points, target, missing_index, parsed_points = _prepare_interpolation_data(params)
+    points = _sorted_points(known_points)
+    h = _validate_equal_spacing(points)
+    table = _finite_difference_table(points)
+    p = (target - points[-1][0]) / h
+    steps: list[dict[str, Any]] = []
+    total = 0.0
+    p_term = 1.0
+    factorial = 1.0
+    last_index = len(points) - 1
+
+    for order in range(len(points)):
+        difference = table[last_index - order][order]
+        if difference is None:
+            raise NumericalError("Backward difference table could not be evaluated.")
+        if order > 0:
+            p_term *= p + (order - 1)
+            factorial *= order
+        multiplier = p_term / factorial
+        term = multiplier * difference
+        total += term
+        steps.append(
+            {
+                "iteration": order,
+                "order": order,
+                "difference": difference,
+                "pTerm": p_term,
+                "factorial": factorial,
+                "coefficient": multiplier,
+                "term": term,
+                "partial": total,
+            }
+        )
+
+    divided_table = _divided_difference_table(points)
+    newton_coefficients = [float(divided_table[0][order]) for order in range(len(points))]
+    coefficients = _newton_standard_coefficients(points, newton_coefficients)
+
+    return _interpolation_result(
+        method_name="Newton Backward Difference Formula",
+        target=target,
+        value=total,
+        known_points=points,
+        parsed_points=parsed_points,
+        missing_index=missing_index,
+        polynomial=_format_polynomial(coefficients),
+        steps=steps,
+        table_rows=_table_rows(points, table),
+        table_kind="finite_difference",
+        extra={"h": h, "p": p},
+    )
+
+
+def _newton_divided_difference_result(
+    params: dict[str, Any],
+    *,
+    method_name: str,
+    reverse: bool,
+) -> dict[str, Any]:
+    known_points, target, missing_index, parsed_points = _prepare_interpolation_data(params)
+    sorted_known_points = _sorted_points(known_points)
+    calculation_points = list(reversed(sorted_known_points)) if reverse else sorted_known_points
+    table = _divided_difference_table(calculation_points)
+    newton_coefficients = [float(table[0][order]) for order in range(len(calculation_points))]
+    steps: list[dict[str, Any]] = []
+    product = 1.0
+    total = 0.0
+
+    for order, coefficient in enumerate(newton_coefficients):
+        if order > 0:
+            product *= target - calculation_points[order - 1][0]
+        term = coefficient * product
+        total += term
+        steps.append(
+            {
+                "iteration": order,
+                "order": order,
+                "xAnchor": calculation_points[order][0],
+                "dividedDifference": coefficient,
+                "product": product,
+                "term": term,
+                "partial": total,
+            }
+        )
+
+    coefficients = _newton_standard_coefficients(calculation_points, newton_coefficients)
+
+    return _interpolation_result(
+        method_name=method_name,
+        target=target,
+        value=total,
+        known_points=sorted_known_points,
+        parsed_points=parsed_points,
+        missing_index=missing_index,
+        polynomial=_format_polynomial(coefficients),
+        steps=steps,
+        table_rows=_table_rows(calculation_points, table),
+        table_kind="divided_difference",
+    )
+
+
+def newton_forward_divided_difference_formula(params: dict[str, Any]) -> dict[str, Any]:
+    return _newton_divided_difference_result(
+        params,
+        method_name="Newton Forward Divided Difference Formula",
+        reverse=False,
+    )
+
+
+def newton_backward_divided_difference_formula(params: dict[str, Any]) -> dict[str, Any]:
+    return _newton_divided_difference_result(
+        params,
+        method_name="Newton Backward Divided Difference Formula",
+        reverse=True,
+    )
 
 
 METHODS = {
@@ -749,6 +1268,10 @@ METHODS = {
     "jacobi": jacobi_method,
     "gauss_seidel": gauss_seidel_method,
     "lagrange": lagrange_interpolation,
+    "nfdf": newton_forward_difference_formula,
+    "nbdf": newton_backward_difference_formula,
+    "nfddf": newton_forward_divided_difference_formula,
+    "nbddf": newton_backward_divided_difference_formula,
 }
 
 

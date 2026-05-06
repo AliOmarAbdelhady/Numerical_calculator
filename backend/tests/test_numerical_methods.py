@@ -12,6 +12,10 @@ from numerical_methods import (  # noqa: E402
     jacobi_method,
     lagrange_interpolation,
     newton_raphson_method,
+    newton_backward_difference_formula,
+    newton_backward_divided_difference_formula,
+    newton_forward_difference_formula,
+    newton_forward_divided_difference_formula,
     secant_method,
     simple_iteration_method,
 )
@@ -101,6 +105,44 @@ class NumericalMethodTests(unittest.TestCase):
         for value, expected in zip(result["solution"], [1.0432692308, 2.2692307692, -1.0817307692]):
             self.assertAlmostEqual(value, expected, places=5)
 
+    def test_linear_methods_reorder_to_diagonal_dominance(self):
+        params = {
+            "matrix": [[1, 10, 2], [10, 1, 2], [1, 2, 10]],
+            "vector": [27, 18, 35],
+            "initial": [0, 0, 0],
+            "tolerance": 1e-8,
+            "maxIterations": 100,
+        }
+
+        for method in (jacobi_method, gauss_seidel_method):
+            with self.subTest(method=method.__name__):
+                result = method(params)
+                self.assertTrue(result["converged"])
+                self.assertEqual(result["solverMode"], "reordered_iterative")
+                self.assertEqual(result["rowOrder"], [2, 1, 3])
+                for value, expected in zip(result["solution"], [1, 2, 3]):
+                    self.assertAlmostEqual(value, expected, places=5)
+
+    def test_linear_methods_use_direct_fallback_when_dominance_is_impossible(self):
+        params = {
+            "matrix": [[1, -1, 2], [-1, 11, -1], [2, -1, 10]],
+            "vector": [6, 25, -11],
+            "initial": [0, 0, 0],
+            "tolerance": 1e-8,
+            "maxIterations": 1,
+        }
+
+        expected_solution = [1085 / 59, 209 / 59, -261 / 59]
+        for method in (jacobi_method, gauss_seidel_method):
+            with self.subTest(method=method.__name__):
+                result = method(params)
+                self.assertFalse(result["converged"])
+                self.assertEqual(result["solverMode"], "direct_fallback")
+                self.assertIn("direct linear-system solution", result["warning"])
+                self.assertLessEqual(result["residual"], 1e-8)
+                for value, expected in zip(result["solution"], expected_solution):
+                    self.assertAlmostEqual(value, expected, places=8)
+
     def test_lagrange_interpolation(self):
         result = lagrange_interpolation(
             {
@@ -109,6 +151,49 @@ class NumericalMethodTests(unittest.TestCase):
             }
         )
         self.assertAlmostEqual(result["value"], 2.875, places=8)
+
+    def test_newton_finite_difference_formulas(self):
+        params = {
+            "points": [{"x": 0, "y": 1}, {"x": 1, "y": 3}, {"x": 2, "y": 2}],
+            "target": 1.5,
+        }
+
+        for method in (newton_forward_difference_formula, newton_backward_difference_formula):
+            with self.subTest(method=method.__name__):
+                result = method(params)
+                self.assertAlmostEqual(result["value"], 2.875, places=8)
+                self.assertEqual(result["tableKind"], "finite_difference")
+                self.assertEqual(len(result["steps"]), 3)
+
+    def test_newton_divided_difference_formulas_with_non_uniform_points(self):
+        params = {
+            "points": [{"x": 0, "y": 1}, {"x": 1, "y": 2}, {"x": 3, "y": 10}],
+            "target": 2,
+        }
+
+        for method in (newton_forward_divided_difference_formula, newton_backward_divided_difference_formula):
+            with self.subTest(method=method.__name__):
+                result = method(params)
+                self.assertAlmostEqual(result["value"], 5, places=8)
+                self.assertEqual(result["tableKind"], "divided_difference")
+                self.assertEqual(len(result["steps"]), 3)
+
+    def test_newton_divided_difference_recovers_one_missing_value(self):
+        params = {
+            "points": [
+                {"x": 0, "y": 1},
+                {"x": 1, "y": 3},
+                {"x": 2, "y": None},
+                {"x": 3, "y": 13},
+            ],
+        }
+
+        for method in (newton_forward_divided_difference_formula, newton_backward_divided_difference_formula):
+            with self.subTest(method=method.__name__):
+                result = method(params)
+                self.assertEqual(result["mode"], "recover_missing")
+                self.assertEqual(result["missing"]["index"], 3)
+                self.assertAlmostEqual(result["missing"]["value"], 7, places=8)
 
 
 if __name__ == "__main__":
