@@ -124,6 +124,26 @@ class NumericalMethodTests(unittest.TestCase):
         self.assertGreater(result["residual"], result["tolerance"])
         self.assertLessEqual(result["steps"][0]["error"], result["tolerance"])
 
+    def test_newton_raphson_method_solves_equation_with_second_derivative(self):
+        result = newton_raphson_method(
+            {
+                "expression": "x^3 - 4*x^(2) - 10 = 0",
+                "x0": 1,
+                "tolerance": 1e-8,
+                "maxIterations": 100,
+            }
+        )
+        self.assertTrue(result["converged"])
+        self.assertEqual(result["normalizedExpression"], "(x^3 - 4*x^(2) - 10) - (0)")
+        self.assertEqual(result["derivativeMode"], "auto")
+        self.assertEqual(result["secondDerivativeMode"], "auto")
+        self.assertAlmostEqual(result["initialDerivative"], -5)
+        self.assertAlmostEqual(result["initialSecondDerivative"], -2)
+        self.assertAlmostEqual(result["initialConvergenceProduct"], 26)
+        self.assertAlmostEqual(result["steps"][0]["derivative"], -5)
+        self.assertAlmostEqual(result["steps"][0]["secondDerivative"], -2)
+        self.assertAlmostEqual(result["root"], 4.49493967126358, places=8)
+
     def test_jacobi_method(self):
         result = jacobi_method(
             {
@@ -198,6 +218,13 @@ class NumericalMethodTests(unittest.TestCase):
             }
         )
         self.assertAlmostEqual(result["value"], 2.875, places=8)
+        self.assertEqual(result["steps"][0]["iteration"], 0)
+        self.assertEqual(result["steps"][0]["basisEquation"], "L_0(x) = ((x - 1) / -1) * ((x - 2) / -2)")
+        self.assertEqual(result["steps"][0]["basisValueEquation"], "L_0(1.5) = ((1.5 - 1) / -1) * ((1.5 - 2) / -2) = -0.125")
+        self.assertEqual(result["steps"][0]["termEquation"], "1 * -0.125 = -0.125")
+        self.assertAlmostEqual(result["steps"][0]["basis"], -0.125)
+        self.assertAlmostEqual(result["steps"][0]["term"], -0.125)
+        self.assertAlmostEqual(result["steps"][-1]["partial"], 2.875)
 
     def test_newton_finite_difference_formulas(self):
         params = {

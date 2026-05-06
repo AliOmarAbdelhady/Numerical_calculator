@@ -148,49 +148,76 @@ def compile_expression(expression: str, variable: str = "x") -> Callable[[float]
     return evaluate
 
 
-def _evaluate_with_derivative(node: ast.AST, value: float, variable: str) -> tuple[float, float]:
+def _evaluate_with_derivatives(node: ast.AST, value: float, variable: str) -> tuple[float, float, float]:
     if isinstance(node, ast.Expression):
-        return _evaluate_with_derivative(node.body, value, variable)
+        return _evaluate_with_derivatives(node.body, value, variable)
 
     if isinstance(node, ast.Constant):
         if not isinstance(node.value, (int, float)):
             raise NumericalError("Expressions may only contain numeric constants.")
-        return float(node.value), 0.0
+        return float(node.value), 0.0, 0.0
 
     if isinstance(node, ast.Name):
         if node.id == variable:
-            return value, 1.0
+            return value, 1.0, 0.0
         if node.id in ALLOWED_CONSTANTS:
-            return ALLOWED_CONSTANTS[node.id], 0.0
+            return ALLOWED_CONSTANTS[node.id], 0.0, 0.0
         raise NumericalError(f"Unknown symbol '{node.id}'.")
 
     if isinstance(node, ast.UnaryOp):
-        operand_value, operand_derivative = _evaluate_with_derivative(node.operand, value, variable)
+        operand_value, operand_derivative, operand_second_derivative = _evaluate_with_derivatives(node.operand, value, variable)
         if isinstance(node.op, ast.USub):
-            return -operand_value, -operand_derivative
+            return -operand_value, -operand_derivative, -operand_second_derivative
         if isinstance(node.op, ast.UAdd):
-            return operand_value, operand_derivative
+            return operand_value, operand_derivative, operand_second_derivative
         raise NumericalError("Unsupported unary operation.")
 
     if isinstance(node, ast.BinOp):
-        left_value, left_derivative = _evaluate_with_derivative(node.left, value, variable)
-        right_value, right_derivative = _evaluate_with_derivative(node.right, value, variable)
+        left_value, left_derivative, left_second_derivative = _evaluate_with_derivatives(node.left, value, variable)
+        right_value, right_derivative, right_second_derivative = _evaluate_with_derivatives(node.right, value, variable)
 
         if isinstance(node.op, ast.Add):
-            return left_value + right_value, left_derivative + right_derivative
+            return left_value + right_value, left_derivative + right_derivative, left_second_derivative + right_second_derivative
         if isinstance(node.op, ast.Sub):
-            return left_value - right_value, left_derivative - right_derivative
+            return left_value - right_value, left_derivative - right_derivative, left_second_derivative - right_second_derivative
         if isinstance(node.op, ast.Mult):
-            return left_value * right_value, left_derivative * right_value + left_value * right_derivative
+            return (
+                left_value * right_value,
+                left_derivative * right_value + left_value * right_derivative,
+                left_second_derivative * right_value + 2 * left_derivative * right_derivative + left_value * right_second_derivative,
+            )
         if isinstance(node.op, ast.Div):
-            return left_value / right_value, (left_derivative * right_value - left_value * right_derivative) / (right_value**2)
+            reciprocal = 1 / right_value
+            reciprocal_derivative = -right_derivative / (right_value**2)
+            reciprocal_second_derivative = (2 * right_derivative**2) / (right_value**3) - right_second_derivative / (right_value**2)
+            return (
+                left_value * reciprocal,
+                left_derivative * reciprocal + left_value * reciprocal_derivative,
+                left_second_derivative * reciprocal + 2 * left_derivative * reciprocal_derivative + left_value * reciprocal_second_derivative,
+            )
         if isinstance(node.op, ast.Pow):
             result = left_value**right_value
-            if right_derivative == 0:
-                return result, right_value * (left_value ** (right_value - 1)) * left_derivative
+            if right_derivative == 0 and right_second_derivative == 0:
+                if right_value == 0:
+                    return result, 0.0, 0.0
+                if right_value == 1:
+                    return result, left_derivative, left_second_derivative
+                return (
+                    result,
+                    right_value * (left_value ** (right_value - 1)) * left_derivative,
+                    right_value * (right_value - 1) * (left_value ** (right_value - 2)) * (left_derivative**2)
+                    + right_value * (left_value ** (right_value - 1)) * left_second_derivative,
+                )
             if left_value <= 0:
                 raise NumericalError("Automatic derivative for variable exponents requires a positive base.")
-            return result, result * (right_derivative * math.log(left_value) + right_value * left_derivative / left_value)
+            log_left = math.log(left_value)
+            exponent_derivative = right_derivative * log_left + right_value * left_derivative / left_value
+            exponent_second_derivative = (
+                right_second_derivative * log_left
+                + 2 * right_derivative * left_derivative / left_value
+                + right_value * (left_second_derivative / left_value - (left_derivative / left_value) ** 2)
+            )
+            return result, result * exponent_derivative, result * (exponent_derivative**2 + exponent_second_derivative)
         if isinstance(node.op, ast.Mod):
             raise NumericalError("Modulo is not supported by automatic differentiation.")
         raise NumericalError("Unsupported binary operation.")
@@ -202,40 +229,66 @@ def _evaluate_with_derivative(node: ast.AST, value: float, variable: str) -> tup
             raise NumericalError("Automatic derivative supports one-argument math functions.")
 
         function_name = node.func.id
-        argument_value, argument_derivative = _evaluate_with_derivative(node.args[0], value, variable)
+        argument_value, argument_derivative, argument_second_derivative = _evaluate_with_derivatives(node.args[0], value, variable)
         function_value = float(ALLOWED_FUNCTIONS[function_name](argument_value))
 
-        derivative_rules: dict[str, Callable[[float], float]] = {
-            "sin": math.cos,
-            "cos": lambda argument: -math.sin(argument),
-            "tan": lambda argument: 1 / (math.cos(argument) ** 2),
-            "asin": lambda argument: 1 / math.sqrt(1 - argument**2),
-            "acos": lambda argument: -1 / math.sqrt(1 - argument**2),
-            "atan": lambda argument: 1 / (1 + argument**2),
-            "sinh": math.cosh,
-            "cosh": math.sinh,
-            "tanh": lambda argument: 1 / (math.cosh(argument) ** 2),
-            "exp": math.exp,
-            "ln": lambda argument: 1 / argument,
-            "log": lambda argument: 1 / argument,
-            "log10": lambda argument: 1 / (argument * math.log(10)),
-            "sqrt": lambda argument: 1 / (2 * math.sqrt(argument)),
-            "degrees": lambda _argument: 180 / math.pi,
-            "radians": lambda _argument: math.pi / 180,
+        derivative_rules: dict[str, tuple[Callable[[float], float], Callable[[float], float]]] = {
+            "sin": (math.cos, lambda argument: -math.sin(argument)),
+            "cos": (lambda argument: -math.sin(argument), lambda argument: -math.cos(argument)),
+            "tan": (
+                lambda argument: 1 / (math.cos(argument) ** 2),
+                lambda argument: 2 * math.tan(argument) / (math.cos(argument) ** 2),
+            ),
+            "asin": (
+                lambda argument: 1 / math.sqrt(1 - argument**2),
+                lambda argument: argument / ((1 - argument**2) ** 1.5),
+            ),
+            "acos": (
+                lambda argument: -1 / math.sqrt(1 - argument**2),
+                lambda argument: -argument / ((1 - argument**2) ** 1.5),
+            ),
+            "atan": (
+                lambda argument: 1 / (1 + argument**2),
+                lambda argument: -2 * argument / ((1 + argument**2) ** 2),
+            ),
+            "sinh": (math.cosh, math.sinh),
+            "cosh": (math.sinh, math.cosh),
+            "tanh": (
+                lambda argument: 1 / (math.cosh(argument) ** 2),
+                lambda argument: -2 * math.tanh(argument) / (math.cosh(argument) ** 2),
+            ),
+            "exp": (math.exp, math.exp),
+            "ln": (lambda argument: 1 / argument, lambda argument: -1 / (argument**2)),
+            "log": (lambda argument: 1 / argument, lambda argument: -1 / (argument**2)),
+            "log10": (lambda argument: 1 / (argument * math.log(10)), lambda argument: -1 / ((argument**2) * math.log(10))),
+            "sqrt": (lambda argument: 1 / (2 * math.sqrt(argument)), lambda argument: -1 / (4 * (argument**1.5))),
+            "degrees": (lambda _argument: 180 / math.pi, lambda _argument: 0.0),
+            "radians": (lambda _argument: math.pi / 180, lambda _argument: 0.0),
         }
 
         if function_name in ("abs", "fabs"):
             if argument_value == 0:
                 raise NumericalError("Automatic derivative of abs is undefined at zero.")
-            return function_value, (1 if argument_value > 0 else -1) * argument_derivative
+            sign = 1 if argument_value > 0 else -1
+            return function_value, sign * argument_derivative, sign * argument_second_derivative
 
-        derivative_rule = derivative_rules.get(function_name)
-        if derivative_rule is None:
+        derivative_rule_pair = derivative_rules.get(function_name)
+        if derivative_rule_pair is None:
             raise NumericalError(f"Automatic derivative does not support {function_name}().")
 
-        return function_value, derivative_rule(argument_value) * argument_derivative
+        first_rule, second_rule = derivative_rule_pair
+        return (
+            function_value,
+            first_rule(argument_value) * argument_derivative,
+            second_rule(argument_value) * (argument_derivative**2) + first_rule(argument_value) * argument_second_derivative,
+        )
 
     raise NumericalError(f"Unsupported expression element: {type(node).__name__}.")
+
+
+def _evaluate_with_derivative(node: ast.AST, value: float, variable: str) -> tuple[float, float]:
+    function_value, derivative, _second_derivative = _evaluate_with_derivatives(node, value, variable)
+    return function_value, derivative
 
 
 def compile_derivative(expression: str, variable: str = "x") -> Callable[[float], float]:
@@ -260,6 +313,32 @@ def compile_derivative(expression: str, variable: str = "x") -> Callable[[float]
         except OverflowError as exc:
             raise NumericalError("Derivative overflowed during evaluation.") from exc
         return _finite_value(float(derivative), "Derivative")
+
+    return evaluate
+
+
+def compile_second_derivative(expression: str, variable: str = "x") -> Callable[[float], float]:
+    if not isinstance(expression, str) or not expression.strip():
+        raise NumericalError("Expression is required.")
+
+    normalized = expression.replace("^", "**")
+    try:
+        tree = ast.parse(normalized, mode="eval")
+    except SyntaxError as exc:
+        raise NumericalError("Expression syntax is invalid.") from exc
+
+    _ExpressionValidator(variable).visit(tree)
+
+    def evaluate(value: float) -> float:
+        try:
+            _, _, second_derivative = _evaluate_with_derivatives(tree, value, variable)
+        except ZeroDivisionError as exc:
+            raise NumericalError("Second derivative divided by zero during evaluation.") from exc
+        except ValueError as exc:
+            raise NumericalError("Second derivative is outside its mathematical domain.") from exc
+        except OverflowError as exc:
+            raise NumericalError("Second derivative overflowed during evaluation.") from exc
+        return _finite_value(float(second_derivative), "Second derivative")
 
     return evaluate
 
@@ -488,6 +567,18 @@ def _split_top_level_equation(expression: str) -> tuple[str, str] | None:
     return left, right
 
 
+def _root_expression(expression: Any) -> str:
+    if not isinstance(expression, str):
+        raise NumericalError("Expression is required.")
+
+    equation = _split_top_level_equation(expression.strip())
+    if equation is None:
+        return expression
+
+    left, right = equation
+    return f"({left}) - ({right})"
+
+
 def _parse_expression_tree(expression: str) -> ast.Expression:
     normalized = expression.replace("^", "**")
     try:
@@ -707,11 +798,12 @@ def simple_iteration_method(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
-    expression = params.get("expression", "")
+    expression = _root_expression(params.get("expression", ""))
     f = compile_expression(expression)
     derivative_expression = params.get("derivativeExpression")
     has_manual_derivative = isinstance(derivative_expression, str) and derivative_expression.strip()
     derivative = compile_expression(derivative_expression) if has_manual_derivative else compile_derivative(expression)
+    second_derivative = compile_second_derivative(expression)
     x_curr = _ensure_number(params.get("x0"), "x0")
     tolerance = _ensure_positive_number(params.get("tolerance", 1e-6), "tolerance")
     max_iterations = _ensure_iterations(params.get("maxIterations", 50))
@@ -719,15 +811,21 @@ def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
     steps: list[dict[str, float | int]] = []
     root = x_curr
     value = f(x_curr)
+    initial_derivative = derivative(x_curr)
+    initial_second_derivative = second_derivative(x_curr)
+    initial_convergence_product = value * initial_second_derivative
     residual = abs(value)
     converged = False
     convergence_status = "max_iterations"
     convergence_message = "Maximum iterations reached before |f(x)| was within tolerance."
-    warning: str | None = None
+    warnings: list[str] = []
+    if initial_convergence_product <= 0:
+        warnings.append("Initial check f(x0) * f''(x0) > 0 is not satisfied; Newton-Raphson may still converge, but the starting point is not ideal.")
 
     if residual <= tolerance:
         return {
             "method": "The Newton-Raphson Method",
+            "normalizedExpression": expression,
             "root": root,
             "value": value,
             "residual": residual,
@@ -737,13 +835,19 @@ def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
             "formula": NEWTON_FORMULA,
             "convergenceStatus": "converged",
             "convergenceMessage": "Initial guess validates convergence because |f(x0)| is within tolerance.",
+            "initialDerivative": initial_derivative,
+            "initialSecondDerivative": initial_second_derivative,
+            "initialConvergenceProduct": initial_convergence_product,
             "derivativeMode": "manual" if has_manual_derivative else "auto",
+            "secondDerivativeMode": "auto",
+            "warning": " ".join(warnings) if warnings else None,
             "steps": steps,
         }
 
     for iteration in range(max_iterations):
         fx = f(x_curr)
         dfx = derivative(x_curr)
+        ddfx = second_derivative(x_curr)
         if abs(dfx) < NEWTON_DERIVATIVE_TOLERANCE:
             raise NumericalError("Derivative is too close to zero.")
 
@@ -759,6 +863,7 @@ def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
                 "xCurrent": x_curr,
                 "fCurrent": fx,
                 "derivative": dfx,
+                "secondDerivative": ddfx,
                 "newtonRatio": newton_ratio,
                 "xNext": x_next,
                 "delta": delta,
@@ -777,12 +882,13 @@ def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
         if error <= tolerance:
             convergence_status = "stalled"
             convergence_message = "Newton step is within tolerance, but |f(x(i+1))| is still too large."
-            warning = "Convergence was not validated: the Newton step became tiny before the residual met tolerance."
+            warnings.append("Convergence was not validated: the Newton step became tiny before the residual met tolerance.")
             break
         x_curr = x_next
 
     return {
         "method": "The Newton-Raphson Method",
+        "normalizedExpression": expression,
         "root": root,
         "value": value,
         "residual": residual,
@@ -792,8 +898,12 @@ def newton_raphson_method(params: dict[str, Any]) -> dict[str, Any]:
         "formula": NEWTON_FORMULA,
         "convergenceStatus": convergence_status,
         "convergenceMessage": convergence_message,
-        "warning": warning,
+        "initialDerivative": initial_derivative,
+        "initialSecondDerivative": initial_second_derivative,
+        "initialConvergenceProduct": initial_convergence_product,
+        "warning": " ".join(warnings) if warnings else None,
         "derivativeMode": "manual" if has_manual_derivative else "auto",
+        "secondDerivativeMode": "auto",
         "steps": steps,
     }
 
@@ -1127,6 +1237,19 @@ def _format_polynomial(coefficients: list[float]) -> str:
     return polynomial[2:] if polynomial.startswith("+ ") else polynomial
 
 
+def _format_step_number(value: float) -> str:
+    if abs(value) < 1e-12:
+        value = 0.0
+    return f"{value:.10g}"
+
+
+def _format_lagrange_factor(variable_value: str, xj: float, denominator: float) -> str:
+    denominator_text = _format_step_number(denominator)
+    xj_magnitude_text = _format_step_number(abs(xj))
+    operator = "-" if xj >= 0 else "+"
+    return f"(({variable_value} {operator} {xj_magnitude_text}) / {denominator_text})"
+
+
 def _is_missing_point_value(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
@@ -1332,6 +1455,8 @@ def lagrange_interpolation(params: dict[str, Any]) -> dict[str, Any]:
         denominator = 1.0
         basis_coefficients = [1.0]
         factors: list[dict[str, float | int]] = []
+        equation_factors: list[str] = []
+        substituted_factors: list[str] = []
 
         for j, (xj, _) in enumerate(points):
             if i == j:
@@ -1342,6 +1467,8 @@ def lagrange_interpolation(params: dict[str, Any]) -> dict[str, Any]:
             basis_at_target *= factor
             denominator *= divisor
             basis_coefficients = _poly_multiply(basis_coefficients, [-xj, 1.0])
+            equation_factors.append(_format_lagrange_factor("x", xj, divisor))
+            substituted_factors.append(_format_lagrange_factor(_format_step_number(target), xj, divisor))
             factors.append(
                 {
                     "point": j + 1,
@@ -1357,13 +1484,27 @@ def lagrange_interpolation(params: dict[str, Any]) -> dict[str, Any]:
         for power, coefficient in enumerate(basis_coefficients):
             coefficients[power] += scale * coefficient
 
+        basis_name = f"L_{i}(x)"
+        basis_at_target_name = f"L_{i}({_format_step_number(target)})"
+        basis_expression = " * ".join(equation_factors) if equation_factors else "1"
+        substituted_expression = " * ".join(substituted_factors) if substituted_factors else "1"
+        term_expression = (
+            f"{_format_step_number(yi)} * {_format_step_number(basis_at_target)}"
+            f" = {_format_step_number(term)}"
+        )
+
         steps.append(
             {
-                "iteration": i + 1,
+                "iteration": i,
                 "x": xi,
                 "y": yi,
+                "basisName": basis_name,
+                "basisEquation": f"{basis_name} = {basis_expression}",
+                "basisValueEquation": f"{basis_at_target_name} = {substituted_expression} = {_format_step_number(basis_at_target)}",
                 "basis": basis_at_target,
+                "termEquation": term_expression,
                 "term": term,
+                "partial": total,
                 "factors": factors,
             }
         )

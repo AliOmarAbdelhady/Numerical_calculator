@@ -79,9 +79,14 @@ type ApiResult = {
   residual?: number;
   warning?: string | null;
   derivativeMode?: string;
+  secondDerivativeMode?: string;
+  normalizedExpression?: string;
   formula?: string;
   convergenceStatus?: string;
   convergenceMessage?: string;
+  initialDerivative?: number;
+  initialSecondDerivative?: number;
+  initialConvergenceProduct?: number;
   selectedBranch?: number;
   selectedGExpression?: string;
   branches?: IterationBranch[];
@@ -968,7 +973,7 @@ export default function App() {
     if (method === "newton") {
       return (
         <>
-          <EquationEditor label="f(x)" prefix="f(x)" value={expression} onChange={setExpression} />
+          <EquationEditor label="Equation or f(x)" prefix="f(x)" value={expression} onChange={setExpression} />
           <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(220px,0.35fr)]">
             <Field label="f'(x) optional">
               <Input value={derivativeExpression} onChange={(event) => setDerivativeExpression(event.target.value)} spellCheck={false} className="font-mono" />
@@ -1163,7 +1168,12 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
               )}
               {method === "newton" && result.derivativeMode && (
                 <span className="inline-flex items-center gap-1 rounded-md bg-sky-100 px-2 py-1 text-xs font-semibold text-sky-700 dark:bg-sky-900 dark:text-sky-100">
-                  {result.derivativeMode === "manual" ? "Manual derivative" : "Auto derivative"}
+                  {result.derivativeMode === "manual" ? "Manual f'(x)" : "Auto f'(x)"}
+                </span>
+              )}
+              {method === "newton" && result.secondDerivativeMode === "auto" && (
+                <span className="inline-flex items-center gap-1 rounded-md bg-sky-100 px-2 py-1 text-xs font-semibold text-sky-700 dark:bg-sky-900 dark:text-sky-100">
+                  Auto f''(x)
                 </span>
               )}
               {method === "iteration" && result.selectedBranch !== undefined && result.branches && result.branches.length > 1 && (
@@ -1208,6 +1218,12 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
 
         {method === "newton" && (result.formula || result.convergenceMessage) && (
           <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            {result.normalizedExpression && (
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-950">
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Solved as f(x)</div>
+                <div className="mt-1 break-words font-mono text-sm text-slate-950 dark:text-slate-50">{result.normalizedExpression}</div>
+              </div>
+            )}
             {result.formula && (
               <div className="rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-950">
                 <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Newton formula</div>
@@ -1220,6 +1236,17 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
                 <div className="mt-1 text-sm text-slate-700 dark:text-slate-100">{result.convergenceMessage}</div>
               </div>
             )}
+          </div>
+        )}
+
+        {method === "newton" && (result.initialDerivative !== undefined || result.initialSecondDerivative !== undefined) && (
+          <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-950">
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Derivative check at x0</div>
+            <div className="mt-2 grid gap-2 text-sm text-slate-700 sm:grid-cols-3 dark:text-slate-100">
+              <span className="font-mono">f'(x0) = {formatNumber(result.initialDerivative)}</span>
+              <span className="font-mono">f''(x0) = {formatNumber(result.initialSecondDerivative)}</span>
+              <span className="font-mono">f(x0)f''(x0) = {formatNumber(result.initialConvergenceProduct)}</span>
+            </div>
           </div>
         )}
 
@@ -1427,10 +1454,12 @@ function StepTable({ method, steps }: { method: MethodKey; steps: Record<string,
     ],
     lagrange: [
       { label: "i", key: "iteration" },
-      { label: "x", key: "x" },
-      { label: "y", key: "y" },
-      { label: "L_i(x)", key: "basis" },
-      { label: "term", key: "term" },
+      { label: "x_i", key: "x" },
+      { label: "y_i", key: "y" },
+      { label: "L_i(x) equation", key: "basisEquation" },
+      { label: "L_i(target) value", key: "basisValueEquation" },
+      { label: "y_i L_i(target)", key: "termEquation" },
+      { label: "partial P(x)", key: "partial" },
     ],
     nfdf: [
       { label: "k", key: "order" },
@@ -1469,7 +1498,7 @@ function StepTable({ method, steps }: { method: MethodKey; steps: Record<string,
   const columns = columnsByMethod[method];
 
   return (
-    <table className="w-full min-w-[720px] border-collapse text-left text-sm">
+    <table className={cn("w-full border-collapse text-left text-sm", method === "lagrange" ? "min-w-[1180px]" : "min-w-[720px]")}>
       <thead className="sticky top-0 z-10 bg-slate-100 text-xs uppercase tracking-wide text-slate-600 dark:bg-slate-800 dark:text-slate-100">
         <tr>
           {columns.map((column) => (
