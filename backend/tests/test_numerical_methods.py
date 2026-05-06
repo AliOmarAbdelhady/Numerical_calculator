@@ -16,6 +16,7 @@ from numerical_methods import (  # noqa: E402
     newton_backward_divided_difference_formula,
     newton_forward_difference_formula,
     newton_forward_divided_difference_formula,
+    numerical_integration,
     secant_method,
     simple_iteration_method,
 )
@@ -268,6 +269,63 @@ class NumericalMethodTests(unittest.TestCase):
                 self.assertEqual(result["mode"], "recover_missing")
                 self.assertEqual(result["missing"]["index"], 3)
                 self.assertAlmostEqual(result["missing"]["value"], 7, places=8)
+
+    def test_basic_integration_rules(self):
+        params = {
+            "expression": "x^2",
+            "a": 0,
+            "b": 2,
+            "mode": "basic",
+        }
+
+        expected = {
+            "midpoint": 2,
+            "trapezoid": 4,
+            "simpson": 8 / 3,
+        }
+        for rule, value in expected.items():
+            with self.subTest(rule=rule):
+                result = numerical_integration({**params, "rule": rule})
+                self.assertEqual(result["integrationMode"], "basic")
+                self.assertEqual(result["integrationRule"], rule)
+                self.assertAlmostEqual(result["value"], value, places=8)
+                self.assertEqual(len(result["steps"]), 1)
+                self.assertIn("curve", result["graph"])
+                self.assertIn("Expression syntax", result["validation"][0])
+
+    def test_composite_integration_rules(self):
+        params = {
+            "expression": "x^2",
+            "a": 0,
+            "b": 2,
+            "mode": "composite",
+            "intervals": 4,
+        }
+
+        expected = {
+            "midpoint": 2.625,
+            "trapezoid": 2.75,
+            "simpson": 8 / 3,
+        }
+        for rule, value in expected.items():
+            with self.subTest(rule=rule):
+                result = numerical_integration({**params, "rule": rule})
+                self.assertEqual(result["intervalCount"], 4)
+                self.assertAlmostEqual(result["h"], 0.5, places=8)
+                self.assertAlmostEqual(result["value"], value, places=8)
+
+    def test_composite_simpson_requires_even_interval_count(self):
+        with self.assertRaisesRegex(Exception, "even number"):
+            numerical_integration(
+                {
+                    "expression": "x^2",
+                    "a": 0,
+                    "b": 2,
+                    "rule": "simpson",
+                    "mode": "composite",
+                    "intervals": 3,
+                }
+            )
 
 
 if __name__ == "__main__":

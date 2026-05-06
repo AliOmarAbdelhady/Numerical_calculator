@@ -87,6 +87,18 @@ def _ensure_iterations(value: Any) -> int:
     return iterations
 
 
+def _ensure_interval_count(value: Any, name: str = "intervals") -> int:
+    try:
+        intervals = int(value)
+    except (TypeError, ValueError) as exc:
+        raise NumericalError(f"{name} must be an integer.") from exc
+    if intervals <= 0:
+        raise NumericalError(f"{name} must be greater than zero.")
+    if intervals > 1000:
+        raise NumericalError(f"{name} cannot exceed 1000.")
+    return intervals
+
+
 def _finite_value(value: float, label: str) -> float:
     if not math.isfinite(value):
         raise NumericalError(f"{label} produced a non-finite value.")
@@ -1699,6 +1711,411 @@ def newton_backward_divided_difference_formula(params: dict[str, Any]) -> dict[s
     )
 
 
+INTEGRATION_RULE_LABELS = {
+    "midpoint": "Midpoint",
+    "trapezoid": "Trapezoid",
+    "simpson": "Simpson's 1/3",
+}
+
+INTEGRATION_MODE_LABELS = {
+    "basic": "Basic",
+    "composite": "Composite",
+}
+
+
+def _parse_integration_rule(value: Any) -> str:
+    if not isinstance(value, str):
+        raise NumericalError("rule must be midpoint, trapezoid, or simpson.")
+
+    normalized = value.strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "mid": "midpoint",
+        "midpoint": "midpoint",
+        "rectangle": "midpoint",
+        "rectangular": "midpoint",
+        "trap": "trapezoid",
+        "trapezoid": "trapezoid",
+        "trapezoidal": "trapezoid",
+        "trapizoid": "trapezoid",
+        "trapizoidal": "trapezoid",
+        "simpson": "simpson",
+        "simpsons": "simpson",
+        "simpson_1/3": "simpson",
+        "simpson_1_3": "simpson",
+        "simpson's": "simpson",
+    }
+    rule = aliases.get(normalized)
+    if rule is None:
+        raise NumericalError("rule must be midpoint, trapezoid, or simpson.")
+    return rule
+
+
+def _parse_integration_mode(value: Any) -> str:
+    if not isinstance(value, str):
+        raise NumericalError("mode must be basic or composite.")
+
+    mode = value.strip().lower()
+    if mode not in INTEGRATION_MODE_LABELS:
+        raise NumericalError("mode must be basic or composite.")
+    return mode
+
+
+def _integration_formula(rule: str, mode: str) -> str:
+    if mode == "basic":
+        formulas = {
+            "midpoint": "I ≈ (b - a) f((a + b) / 2)",
+            "trapezoid": "I ≈ (b - a) [f(a) + f(b)] / 2",
+            "simpson": "I ≈ (b - a) [f(a) + 4f((a + b) / 2) + f(b)] / 6",
+        }
+        return formulas[rule]
+
+    formulas = {
+        "midpoint": "I ≈ h Σ f((x(i-1) + x(i)) / 2), h = (b - a) / n",
+        "trapezoid": "I ≈ h [f(x0)/2 + f(x1) + ... + f(x(n-1)) + f(xn)/2], h = (b - a) / n",
+        "simpson": "I ≈ h/3 [f(x0) + 4Σf(x odd) + 2Σf(x even) + f(xn)], h = (b - a) / n and n is even",
+    }
+    return formulas[rule]
+
+
+def _evaluate_integrand(f: Callable[[float], float], x_value: float, label: str) -> float:
+    try:
+        return f(x_value)
+    except NumericalError as exc:
+        raise NumericalError(f"{label} at x = {_format_step_number(x_value)} failed: {exc}") from exc
+
+
+def _integration_graph_data(
+    f: Callable[[float], float],
+    a: float,
+    b: float,
+    panels: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sample_count = 160
+    curve: list[dict[str, float]] = []
+
+    for index in range(sample_count + 1):
+        x_value = a + (b - a) * index / sample_count
+        y_value = _evaluate_integrand(f, x_value, "Graph sample")
+        curve.append({"x": x_value, "y": y_value})
+
+    y_values = [point["y"] for point in curve]
+    for panel in panels:
+        for key in ("fLeft", "fMidpoint", "fRight"):
+            value = panel.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                y_values.append(float(value))
+
+    y_min = min(0.0, *y_values)
+    y_max = max(0.0, *y_values)
+    if abs(y_max - y_min) <= PIVOT_TOLERANCE:
+        padding = max(1.0, abs(y_max) * 0.2)
+        y_min -= padding
+        y_max += padding
+    else:
+        padding = (y_max - y_min) * 0.08
+        y_min -= padding
+        y_max += padding
+
+    return {
+        "curve": curve,
+        "panels": panels,
+        "domain": [a, b],
+        "range": [y_min, y_max],
+    }
+
+
+def _integration_result(
+    *,
+    rule: str,
+    mode: str,
+    a: float,
+    b: float,
+    h: float,
+    intervals: int,
+    value: float,
+    steps: list[dict[str, Any]],
+    f: Callable[[float], float],
+    extra_details: list[str] | None = None,
+) -> dict[str, Any]:
+    rule_label = INTEGRATION_RULE_LABELS[rule]
+    mode_label = INTEGRATION_MODE_LABELS[mode]
+    formula_details = [
+        f"a = {_format_step_number(a)}, b = {_format_step_number(b)}",
+        f"h = {_format_step_number(h)}",
+        f"Final approximation = {_format_step_number(value)}",
+    ]
+    if extra_details:
+        formula_details[2:2] = extra_details
+
+    validation = [
+        "Expression syntax and math functions were validated.",
+        "Lower limit is less than upper limit.",
+        "All required function values are finite.",
+    ]
+    if mode == "composite":
+        validation.append("Composite interval count is a positive integer.")
+    if rule == "simpson":
+        validation.append("Simpson's 1/3 rule uses one midpoint in basic mode and an even interval count in composite mode.")
+
+    return {
+        "method": f"{mode_label} {rule_label} Rule",
+        "value": value,
+        "iterations": len(steps),
+        "integrationRule": rule,
+        "integrationMode": mode,
+        "intervalCount": intervals,
+        "a": a,
+        "b": b,
+        "h": h,
+        "formula": _integration_formula(rule, mode),
+        "formulaDetails": formula_details,
+        "validation": validation,
+        "graph": _integration_graph_data(f, a, b, steps),
+        "steps": steps,
+    }
+
+
+def numerical_integration(params: dict[str, Any]) -> dict[str, Any]:
+    f = compile_expression(params.get("expression", ""))
+    a = _ensure_number(params.get("a"), "a")
+    b = _ensure_number(params.get("b"), "b")
+    rule = _parse_integration_rule(params.get("rule", "midpoint"))
+    mode = _parse_integration_mode(params.get("mode", "basic"))
+
+    if a >= b:
+        raise NumericalError("a must be less than b for numerical integration.")
+
+    if mode == "basic":
+        intervals = 2 if rule == "simpson" else 1
+    else:
+        intervals = _ensure_interval_count(params.get("intervals", 4))
+        if rule == "simpson" and intervals < 2:
+            raise NumericalError("Composite Simpson's rule requires at least 2 intervals.")
+        if rule == "simpson" and intervals % 2 != 0:
+            raise NumericalError("Composite Simpson's rule requires an even number of intervals.")
+
+    steps: list[dict[str, Any]] = []
+
+    if mode == "basic":
+        width = b - a
+        midpoint = (a + b) / 2
+        if rule == "midpoint":
+            f_midpoint = _evaluate_integrand(f, midpoint, "f(midpoint)")
+            contribution = width * f_midpoint
+            steps.append(
+                {
+                    "iteration": 1,
+                    "left": a,
+                    "right": b,
+                    "midpoint": midpoint,
+                    "width": width,
+                    "fMidpoint": f_midpoint,
+                    "contribution": contribution,
+                    "partial": contribution,
+                    "equation": f"({_format_step_number(width)}) * f({_format_step_number(midpoint)})",
+                }
+            )
+            return _integration_result(
+                rule=rule,
+                mode=mode,
+                a=a,
+                b=b,
+                h=width,
+                intervals=intervals,
+                value=contribution,
+                steps=steps,
+                f=f,
+            )
+
+        f_left = _evaluate_integrand(f, a, "f(a)")
+        f_right = _evaluate_integrand(f, b, "f(b)")
+        if rule == "trapezoid":
+            average_height = (f_left + f_right) / 2
+            contribution = width * average_height
+            steps.append(
+                {
+                    "iteration": 1,
+                    "left": a,
+                    "right": b,
+                    "width": width,
+                    "fLeft": f_left,
+                    "fRight": f_right,
+                    "averageHeight": average_height,
+                    "contribution": contribution,
+                    "partial": contribution,
+                    "equation": f"({_format_step_number(width)} / 2) * ({_format_step_number(f_left)} + {_format_step_number(f_right)})",
+                }
+            )
+            return _integration_result(
+                rule=rule,
+                mode=mode,
+                a=a,
+                b=b,
+                h=width,
+                intervals=intervals,
+                value=contribution,
+                steps=steps,
+                f=f,
+            )
+
+        f_midpoint = _evaluate_integrand(f, midpoint, "f(midpoint)")
+        h = width / 2
+        contribution = (h / 3) * (f_left + 4 * f_midpoint + f_right)
+        steps.append(
+            {
+                "iteration": 1,
+                "left": a,
+                "midpoint": midpoint,
+                "right": b,
+                "h": h,
+                "fLeft": f_left,
+                "fMidpoint": f_midpoint,
+                "fRight": f_right,
+                "weightedSum": f_left + 4 * f_midpoint + f_right,
+                "contribution": contribution,
+                "partial": contribution,
+                "equation": f"({_format_step_number(h)} / 3) * ({_format_step_number(f_left)} + 4({_format_step_number(f_midpoint)}) + {_format_step_number(f_right)})",
+            }
+        )
+        return _integration_result(
+            rule=rule,
+            mode=mode,
+            a=a,
+            b=b,
+            h=h,
+            intervals=intervals,
+            value=contribution,
+            steps=steps,
+            f=f,
+        )
+
+    h = (b - a) / intervals
+    total = 0.0
+
+    if rule == "midpoint":
+        midpoint_sum = 0.0
+        for index in range(1, intervals + 1):
+            left = a + (index - 1) * h
+            right = left + h
+            midpoint = (left + right) / 2
+            f_midpoint = _evaluate_integrand(f, midpoint, f"f(midpoint {index})")
+            contribution = h * f_midpoint
+            total += contribution
+            midpoint_sum += f_midpoint
+            steps.append(
+                {
+                    "iteration": index,
+                    "left": left,
+                    "right": right,
+                    "midpoint": midpoint,
+                    "width": h,
+                    "fMidpoint": f_midpoint,
+                    "contribution": contribution,
+                    "partial": total,
+                    "equation": f"{_format_step_number(h)} * f({_format_step_number(midpoint)})",
+                }
+            )
+        return _integration_result(
+            rule=rule,
+            mode=mode,
+            a=a,
+            b=b,
+            h=h,
+            intervals=intervals,
+            value=total,
+            steps=steps,
+            f=f,
+            extra_details=[f"Σ midpoint heights = {_format_step_number(midpoint_sum)}"],
+        )
+
+    if rule == "trapezoid":
+        for index in range(1, intervals + 1):
+            left = a + (index - 1) * h
+            right = left + h
+            f_left = _evaluate_integrand(f, left, f"f(x{index - 1})")
+            f_right = _evaluate_integrand(f, right, f"f(x{index})")
+            average_height = (f_left + f_right) / 2
+            contribution = h * average_height
+            total += contribution
+            steps.append(
+                {
+                    "iteration": index,
+                    "left": left,
+                    "right": right,
+                    "width": h,
+                    "fLeft": f_left,
+                    "fRight": f_right,
+                    "averageHeight": average_height,
+                    "contribution": contribution,
+                    "partial": total,
+                    "equation": f"({_format_step_number(h)} / 2) * ({_format_step_number(f_left)} + {_format_step_number(f_right)})",
+                }
+            )
+        return _integration_result(
+            rule=rule,
+            mode=mode,
+            a=a,
+            b=b,
+            h=h,
+            intervals=intervals,
+            value=total,
+            steps=steps,
+            f=f,
+        )
+
+    odd_sum = 0.0
+    even_sum = 0.0
+    for node_index in range(1, intervals):
+        y_value = _evaluate_integrand(f, a + node_index * h, f"f(x{node_index})")
+        if node_index % 2 == 0:
+            even_sum += y_value
+        else:
+            odd_sum += y_value
+
+    for panel_index in range(intervals // 2):
+        left = a + (2 * panel_index) * h
+        midpoint = left + h
+        right = left + 2 * h
+        f_left = _evaluate_integrand(f, left, f"f(x{2 * panel_index})")
+        f_midpoint = _evaluate_integrand(f, midpoint, f"f(x{2 * panel_index + 1})")
+        f_right = _evaluate_integrand(f, right, f"f(x{2 * panel_index + 2})")
+        weighted_sum = f_left + 4 * f_midpoint + f_right
+        contribution = (h / 3) * weighted_sum
+        total += contribution
+        steps.append(
+            {
+                "iteration": panel_index + 1,
+                "left": left,
+                "midpoint": midpoint,
+                "right": right,
+                "h": h,
+                "fLeft": f_left,
+                "fMidpoint": f_midpoint,
+                "fRight": f_right,
+                "weightedSum": weighted_sum,
+                "contribution": contribution,
+                "partial": total,
+                "equation": f"({_format_step_number(h)} / 3) * ({_format_step_number(f_left)} + 4({_format_step_number(f_midpoint)}) + {_format_step_number(f_right)})",
+            }
+        )
+
+    return _integration_result(
+        rule=rule,
+        mode=mode,
+        a=a,
+        b=b,
+        h=h,
+        intervals=intervals,
+        value=total,
+        steps=steps,
+        f=f,
+        extra_details=[
+            f"Σ odd-index heights = {_format_step_number(odd_sum)}",
+            f"Σ even-index heights = {_format_step_number(even_sum)}",
+        ],
+    )
+
+
 METHODS = {
     "bisection": bisection_method,
     "secant": secant_method,
@@ -1711,6 +2128,7 @@ METHODS = {
     "nbdf": newton_backward_difference_formula,
     "nfddf": newton_forward_divided_difference_formula,
     "nbddf": newton_backward_divided_difference_formula,
+    "integration": numerical_integration,
 }
 
 

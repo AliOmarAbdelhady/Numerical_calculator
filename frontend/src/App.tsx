@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import {
   AlertCircle,
   Calculator,
+  ChartArea,
   CheckCircle2,
   Divide,
   GitBranch,
@@ -42,7 +43,11 @@ type MethodKey =
   | "nfdf"
   | "nbdf"
   | "nfddf"
-  | "nbddf";
+  | "nbddf"
+  | "integration";
+
+type IntegrationRule = "midpoint" | "trapezoid" | "simpson";
+type IntegrationMode = "basic" | "composite";
 
 type ResultPoint = {
   x: number;
@@ -54,6 +59,29 @@ type TableRow = {
   index: number;
   x: number;
   values: number[];
+};
+
+type GraphPoint = {
+  x: number;
+  y: number;
+};
+
+type IntegrationGraphPanel = {
+  iteration: number;
+  left: number;
+  right: number;
+  midpoint?: number;
+  fLeft?: number;
+  fMidpoint?: number;
+  fRight?: number;
+  contribution: number;
+};
+
+type IntegrationGraph = {
+  curve: GraphPoint[];
+  panels: IntegrationGraphPanel[];
+  domain: [number, number];
+  range: [number, number];
 };
 
 type IterationBranch = {
@@ -100,6 +128,14 @@ type ApiResult = {
   tableKind?: "basis" | "finite_difference" | "divided_difference";
   h?: number;
   p?: number;
+  a?: number;
+  b?: number;
+  integrationRule?: IntegrationRule;
+  integrationMode?: IntegrationMode;
+  intervalCount?: number;
+  formulaDetails?: string[];
+  validation?: string[];
+  graph?: IntegrationGraph;
   steps: Record<string, unknown>[];
 };
 
@@ -108,6 +144,15 @@ type ThemeMode = "light" | "dark";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:5050";
 const interpolationMethodKeys = new Set<MethodKey>(["lagrange", "nfdf", "nbdf", "nfddf", "nbddf"]);
+const integrationRuleOptions: Array<{ value: IntegrationRule; label: string }> = [
+  { value: "midpoint", label: "Midpoint" },
+  { value: "trapezoid", label: "Trapezoid" },
+  { value: "simpson", label: "Simpson's" },
+];
+const integrationModeOptions: Array<{ value: IntegrationMode; label: string }> = [
+  { value: "basic", label: "Basic" },
+  { value: "composite", label: "Composite" },
+];
 
 function isInterpolationMethodKey(value: MethodKey) {
   return interpolationMethodKeys.has(value);
@@ -210,6 +255,13 @@ const methods: Array<{
     accent: "bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-100",
     icon: Table2,
   },
+  {
+    key: "integration",
+    title: "Numerical Integration",
+    short: "Area approximation",
+    accent: "bg-lime-100 text-lime-800 dark:bg-lime-900 dark:text-lime-100",
+    icon: ChartArea,
+  },
 ];
 
 const initialMatrix = [
@@ -227,6 +279,14 @@ function parseNumber(value: string, label: string) {
   const number = Number(value);
   if (!Number.isFinite(number)) {
     throw new Error(`${label} must be a valid number.`);
+  }
+  return number;
+}
+
+function parseInteger(value: string, label: string) {
+  const number = parseNumber(value, label);
+  if (!Number.isInteger(number)) {
+    throw new Error(`${label} must be an integer.`);
   }
   return number;
 }
@@ -634,6 +694,9 @@ export default function App() {
     { x: "2", y: "2" },
   ]);
   const [target, setTarget] = useState("1.5");
+  const [integrationRule, setIntegrationRule] = useState<IntegrationRule>("midpoint");
+  const [integrationMode, setIntegrationMode] = useState<IntegrationMode>("basic");
+  const [integrationIntervals, setIntegrationIntervals] = useState("4");
   const [result, setResult] = useState<ApiResult | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -691,11 +754,38 @@ export default function App() {
       { x: "2", y: "2" },
     ]);
     setTarget("1.5");
+    setIntegrationRule("midpoint");
+    setIntegrationMode("basic");
+    setIntegrationIntervals("4");
     setError("");
     setResult(null);
   }
 
   function buildPayload() {
+    if (method === "integration") {
+      const params: {
+        expression: string;
+        a: number;
+        b: number;
+        rule: IntegrationRule;
+        mode: IntegrationMode;
+        intervals?: number;
+      } = {
+        expression,
+        a: parseNumber(a, "a"),
+        b: parseNumber(b, "b"),
+        rule: integrationRule,
+        mode: integrationMode,
+      };
+      if (integrationMode === "composite") {
+        params.intervals = parseInteger(integrationIntervals, "Intervals");
+      }
+      return {
+        method,
+        params,
+      };
+    }
+
     const common = {
       tolerance: parseNumber(tolerance, "Tolerance"),
       maxIterations: parseNumber(maxIterations, "Max iterations"),
@@ -899,7 +989,7 @@ export default function App() {
                 </motion.div>
               </AnimatePresence>
 
-              {!isInterpolationMethod && (
+              {!isInterpolationMethod && method !== "integration" && (
                 <div className="grid gap-4 sm:grid-cols-2">
                   <Field label="Tolerance">
                     <Input value={tolerance} onChange={(event) => setTolerance(event.target.value)} inputMode="decimal" />
@@ -986,11 +1076,74 @@ export default function App() {
       );
     }
 
+    if (method === "integration") {
+      return renderIntegrationEditor();
+    }
+
     if (isLinearMethod) {
       return renderLinearSystemEditor();
     }
 
     return renderInterpolationEditor();
+  }
+
+  function renderIntegrationEditor() {
+    return (
+      <div className="space-y-4">
+        <EquationEditor label="f(x)" prefix="f(x)" value={expression} onChange={setExpression} />
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="a">
+            <Input value={a} onChange={(event) => setA(event.target.value)} inputMode="decimal" />
+          </Field>
+          <Field label="b">
+            <Input value={b} onChange={(event) => setB(event.target.value)} inputMode="decimal" />
+          </Field>
+        </div>
+
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="space-y-2">
+            <Label>Rule</Label>
+            <div className="grid grid-cols-3 gap-2">
+              {integrationRuleOptions.map((option) => (
+                <Button
+                  key={option.value}
+                  type="button"
+                  variant={integrationRule === option.value ? "default" : "outline"}
+                  onClick={() => setIntegrationRule(option.value)}
+                  className="min-h-10 px-2"
+                >
+                  {option.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <Label>Mode</Label>
+            <div className="grid grid-cols-2 gap-2">
+              {integrationModeOptions.map((option) => (
+                <Button
+                  key={option.value}
+                  type="button"
+                  variant={integrationMode === option.value ? "default" : "outline"}
+                  onClick={() => setIntegrationMode(option.value)}
+                  className="min-h-10 px-2"
+                >
+                  {option.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {integrationMode === "composite" && (
+          <Field label="Intervals n" className="max-w-xs">
+            <Input value={integrationIntervals} onChange={(event) => setIntegrationIntervals(event.target.value)} inputMode="numeric" />
+          </Field>
+        )}
+      </div>
+    );
   }
 
   function renderLinearSystemEditor() {
@@ -1144,6 +1297,7 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
   }
 
   const isInterpolation = isInterpolationMethodKey(method);
+  const isIntegration = method === "integration";
   const primaryValue =
     result.solution !== undefined
       ? formatVector(result.solution)
@@ -1182,6 +1336,12 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
                   Branch {result.selectedBranch} selected
                 </span>
               )}
+              {isIntegration && result.integrationRule && result.integrationMode && (
+                <span className="inline-flex items-center gap-1 rounded-md bg-lime-100 px-2 py-1 text-xs font-semibold text-lime-800 dark:bg-lime-900 dark:text-lime-100">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  {result.integrationMode} {result.integrationRule}
+                </span>
+              )}
               {result.solverMode === "direct_fallback" ? (
                 <span className="inline-flex items-center gap-1 rounded-md bg-emerald-100 px-2 py-1 text-xs font-semibold text-emerald-700 dark:bg-emerald-900 dark:text-emerald-100">
                   <CheckCircle2 className="h-3.5 w-3.5" />
@@ -1204,15 +1364,51 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
         </div>
 
         <div className="mt-4 grid gap-3 md:grid-cols-3">
-          <Metric label={result.solution ? "Solution" : result.missing ? "Recovered f(x)" : isInterpolation ? "P(x)" : method === "iteration" ? "Fixed point" : "Root"} value={primaryValue} />
-          <Metric label={isInterpolation ? "Terms" : "Iterations"} value={result.iterations ?? result.steps.length} />
-          <Metric label={isInterpolation ? "Target x" : result.residual !== undefined ? "Residual" : "Value"} value={formatNumber(isInterpolation ? result.target : result.residual ?? result.value ?? "")} />
+          <Metric label={result.solution ? "Solution" : result.missing ? "Recovered f(x)" : isIntegration ? "Integral" : isInterpolation ? "P(x)" : method === "iteration" ? "Fixed point" : "Root"} value={primaryValue} />
+          <Metric label={isIntegration ? "Subintervals" : isInterpolation ? "Terms" : "Iterations"} value={isIntegration ? result.intervalCount ?? result.iterations ?? result.steps.length : result.iterations ?? result.steps.length} />
+          <Metric label={isIntegration ? "h" : isInterpolation ? "Target x" : result.residual !== undefined ? "Residual" : "Value"} value={formatNumber(isIntegration ? result.h : isInterpolation ? result.target : result.residual ?? result.value ?? "")} />
         </div>
 
         {result.polynomial && (
           <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-950">
             <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Polynomial</div>
             <div className="mt-1 break-words font-mono text-sm text-slate-950 dark:text-slate-50">{result.polynomial}</div>
+          </div>
+        )}
+
+        {isIntegration && (
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            {result.formula && (
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-950">
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Rule formula</div>
+                <div className="mt-1 break-words font-mono text-sm text-slate-950 dark:text-slate-50">{result.formula}</div>
+              </div>
+            )}
+            {result.formulaDetails && result.formulaDetails.length > 0 && (
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-950">
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Substitution</div>
+                <div className="mt-2 space-y-1 text-sm text-slate-700 dark:text-slate-100">
+                  {result.formulaDetails.map((item) => (
+                    <div key={item} className="font-mono">
+                      {item}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {result.validation && result.validation.length > 0 && (
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-950 lg:col-span-2">
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">Validation</div>
+                <div className="mt-2 grid gap-2 text-sm text-slate-700 sm:grid-cols-2 dark:text-slate-100">
+                  {result.validation.map((item) => (
+                    <div key={item} className="flex items-start gap-2">
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-300" />
+                      <span>{item}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1298,6 +1494,7 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
       </div>
 
       {isInterpolation && <InterpolationVisuals result={result} />}
+      {isIntegration && result.graph && <IntegrationVisuals result={result} />}
 
       <div className="rounded-md border border-slate-200 bg-white shadow-panel dark:border-slate-700 dark:bg-slate-900">
         <div className="border-b border-slate-200 p-4 dark:border-slate-700">
@@ -1308,6 +1505,137 @@ function ResultPanel({ result, error, method }: { result: ApiResult | null; erro
         </div>
       </div>
     </section>
+  );
+}
+
+function IntegrationVisuals({ result }: { result: ApiResult }) {
+  const graph = result.graph;
+  if (!graph || graph.curve.length < 2) {
+    return null;
+  }
+
+  const width = 760;
+  const height = 340;
+  const padding = { left: 54, right: 18, top: 22, bottom: 42 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const [xMin, xMax] = graph.domain;
+  const [yMin, yMax] = graph.range;
+  const rule = result.integrationRule ?? "midpoint";
+
+  function plotX(xValue: number) {
+    return padding.left + ((xValue - xMin) / (xMax - xMin)) * plotWidth;
+  }
+
+  function plotY(yValue: number) {
+    return padding.top + ((yMax - yValue) / (yMax - yMin)) * plotHeight;
+  }
+
+  const zeroY = plotY(0);
+  const curvePath = graph.curve
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${plotX(point.x).toFixed(2)} ${plotY(point.y).toFixed(2)}`)
+    .join(" ");
+
+  const verticalTicks = Array.from({ length: 5 }, (_, index) => xMin + ((xMax - xMin) * index) / 4);
+  const horizontalTicks = Array.from({ length: 5 }, (_, index) => yMin + ((yMax - yMin) * index) / 4);
+
+  function panelPath(panel: IntegrationGraphPanel) {
+    const left = plotX(panel.left);
+    const right = plotX(panel.right);
+
+    if (rule === "midpoint" && panel.fMidpoint !== undefined) {
+      const top = plotY(panel.fMidpoint);
+      return `M ${left.toFixed(2)} ${zeroY.toFixed(2)} L ${left.toFixed(2)} ${top.toFixed(2)} L ${right.toFixed(2)} ${top.toFixed(2)} L ${right.toFixed(2)} ${zeroY.toFixed(2)} Z`;
+    }
+
+    if (rule === "trapezoid" && panel.fLeft !== undefined && panel.fRight !== undefined) {
+      return `M ${left.toFixed(2)} ${zeroY.toFixed(2)} L ${left.toFixed(2)} ${plotY(panel.fLeft).toFixed(2)} L ${right.toFixed(2)} ${plotY(panel.fRight).toFixed(2)} L ${right.toFixed(2)} ${zeroY.toFixed(2)} Z`;
+    }
+
+    if (rule === "simpson" && panel.midpoint !== undefined && panel.fLeft !== undefined && panel.fMidpoint !== undefined && panel.fRight !== undefined) {
+      const startX = plotX(panel.left);
+      const startY = plotY(panel.fLeft);
+      const middleX = plotX(panel.midpoint);
+      const middleY = plotY(panel.fMidpoint);
+      const endX = plotX(panel.right);
+      const endY = plotY(panel.fRight);
+      const controlX = 2 * middleX - (startX + endX) / 2;
+      const controlY = 2 * middleY - (startY + endY) / 2;
+      return `M ${startX.toFixed(2)} ${zeroY.toFixed(2)} L ${startX.toFixed(2)} ${startY.toFixed(2)} Q ${controlX.toFixed(2)} ${controlY.toFixed(2)} ${endX.toFixed(2)} ${endY.toFixed(2)} L ${endX.toFixed(2)} ${zeroY.toFixed(2)} Z`;
+    }
+
+    return null;
+  }
+
+  return (
+    <div className="rounded-md border border-slate-200 bg-white shadow-panel dark:border-slate-700 dark:bg-slate-900">
+      <div className="border-b border-slate-200 p-4 dark:border-slate-700">
+        <h2 className="text-lg font-semibold text-slate-950 dark:text-slate-50">Graph</h2>
+      </div>
+
+      <div className="p-4">
+        <div className="overflow-hidden rounded-md border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-950">
+          <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Numerical integration graph" className="h-auto w-full">
+            <rect x="0" y="0" width={width} height={height} className="fill-slate-50 dark:fill-slate-950" />
+
+            {verticalTicks.map((tick) => {
+              const x = plotX(tick);
+              return (
+                <g key={`vx-${tick}`}>
+                  <line x1={x} y1={padding.top} x2={x} y2={height - padding.bottom} className="stroke-slate-200 dark:stroke-slate-800" strokeWidth="1" />
+                  <text x={x} y={height - 16} textAnchor="middle" className="fill-slate-500 text-[11px] dark:fill-slate-300">
+                    {formatNumber(tick)}
+                  </text>
+                </g>
+              );
+            })}
+
+            {horizontalTicks.map((tick) => {
+              const y = plotY(tick);
+              return (
+                <g key={`hy-${tick}`}>
+                  <line x1={padding.left} y1={y} x2={width - padding.right} y2={y} className="stroke-slate-200 dark:stroke-slate-800" strokeWidth="1" />
+                  <text x={padding.left - 10} y={y + 4} textAnchor="end" className="fill-slate-500 text-[11px] dark:fill-slate-300">
+                    {formatNumber(tick)}
+                  </text>
+                </g>
+              );
+            })}
+
+            <line x1={padding.left} y1={zeroY} x2={width - padding.right} y2={zeroY} className="stroke-slate-400 dark:stroke-slate-500" strokeWidth="1.4" />
+            <line x1={padding.left} y1={padding.top} x2={padding.left} y2={height - padding.bottom} className="stroke-slate-400 dark:stroke-slate-500" strokeWidth="1.4" />
+
+            {graph.panels.map((panel) => {
+              const path = panelPath(panel);
+              if (!path) {
+                return null;
+              }
+              return (
+                <path
+                  key={`${panel.iteration}-${panel.left}-${panel.right}`}
+                  d={path}
+                  className="fill-lime-400/30 stroke-lime-600/60 dark:fill-lime-300/20 dark:stroke-lime-300/55"
+                  strokeWidth="1"
+                />
+              );
+            })}
+
+            <path d={curvePath} fill="none" className="stroke-blue-600 dark:stroke-sky-300" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-300">
+          <span className="inline-flex items-center gap-2">
+            <span className="h-2.5 w-6 rounded-sm bg-blue-600 dark:bg-sky-300" />
+            Function
+          </span>
+          <span className="inline-flex items-center gap-2">
+            <span className="h-2.5 w-6 rounded-sm bg-lime-400/70 dark:bg-lime-300/50" />
+            Rule panels
+          </span>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1469,12 +1797,26 @@ function StepTable({ method, steps }: { method: MethodKey; steps: Record<string,
       { label: "term", key: "term" },
       { label: "partial", key: "partial" },
     ],
+    integration: [
+      { label: "i", key: "iteration" },
+      { label: "left", key: "left" },
+      { label: "midpoint", key: "midpoint" },
+      { label: "right", key: "right" },
+      { label: "width", key: "width" },
+      { label: "h", key: "h" },
+      { label: "f(left)", key: "fLeft" },
+      { label: "f(midpoint)", key: "fMidpoint" },
+      { label: "f(right)", key: "fRight" },
+      { label: "contribution", key: "contribution" },
+      { label: "partial", key: "partial" },
+      { label: "equation", key: "equation" },
+    ],
   };
 
   const columns = columnsByMethod[method];
 
   return (
-    <table className={cn("w-full border-collapse text-left text-sm", method === "lagrange" ? "min-w-[1180px]" : "min-w-[720px]")}>
+    <table className={cn("w-full border-collapse text-left text-sm", method === "lagrange" || method === "integration" ? "min-w-[1180px]" : "min-w-[720px]")}>
       <thead className="sticky top-0 z-10 bg-slate-100 text-xs uppercase tracking-wide text-slate-600 dark:bg-slate-800 dark:text-slate-100">
         <tr>
           {columns.map((column) => (
